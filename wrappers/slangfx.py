@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-slangfx.py — convenience wrapper around the slangfx binary.
+slangfx.py - convenience wrapper around the slangfx binary.
 
 Pipes:
-    ffmpeg (decode → rawvideo) → slangfx (apply slang shaders) → ffmpeg (encode)
+    ffmpeg (decode -> rawvideo) -> slangfx (apply slang shaders) -> ffmpeg (encode)
 
 This script handles dimension probing, pixel-format conversion, audio
 passthrough, and writes a normal output container. Audio is taken from the
