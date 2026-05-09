@@ -105,7 +105,7 @@ pixel-perfect; built-in passthrough preserves red.
 
 ---
 
-## Phase 5 — Multi-pass chain *(MVP done; alias / Pass<n> / Original deferred)*
+## Phase 5 — Multi-pass chain *(done, all sub-phases)*
 
 - [x] Per-pass `pass_state` holding its own framebuffer image, render
       pass, descriptor set, pipeline, sampler.
@@ -113,48 +113,55 @@ pixel-perfect; built-in passthrough preserves red.
       and `scale[_x|_y]` (source / viewport / absolute, per axis).
 - [x] Per-pass sampler honors `filter_linear` and `wrap_mode`.
 - [x] Source chaining: pass N's `Source` descriptor binds pass N-1's
-      output view (or the original input for pass 0). Render pass
-      finalLayout = SHADER_READ_ONLY so chaining is layout-correct.
-- [ ] **Phase 5b — alias bindings:** preset `alias<i> = name` declares
-      a sampler the next pass can bind by that name. Implement: build
-      alias→pass-index map at setup, extend descriptor sets to include
-      one extra sampler binding per resolved alias used by the
-      consuming pass.
-- [ ] **Phase 5c — `Pass<n>`:** numeric pass refs. Same mechanism as
-      aliases but keyed by index. Detect by SPIR-V reflection in
-      Phase 7.
-- [ ] **Phase 5d — `Original` / `OriginalSize`:** every pass should be
-      able to bind the *original* input image as a sampler named
-      `Original` and read `OriginalSize` from push constants. Currently
-      `OriginalSize` is set in push but no descriptor binding exists.
+      output view (or original input for pass 0).
+- [x] **Phase 5b — alias bindings:** preset `alias<i> = name` builds an
+      alias→pass-index map; reflected sampler names matching aliases
+      get bound to that pass's output view.
+- [x] **Phase 5c — `Pass<n>`:** numeric pass refs resolved by parsing
+      digits after `Pass`, indexing `passes[n].out_view` (only for
+      n < current_pass_idx; self-references rejected).
+- [x] **Phase 5d — `Original` / `OriginalSize`:** sampler named
+      `Original` (and `OriginalHistory0`) binds the original input
+      image. `OriginalSize` already populated in push constants.
 
-**Verified:** 2-pass `double_invert.slangp` produces byte-perfect
-identity from a 16×16 RGB gradient (every pass writes through the
-chain correctly). 4-pass shaders without alias references would also
-work. Real libretro shader `image-adjustment.slangp` (single pass with
-`#include`) compiles and runs.
+**Verified:** `alias_test.slangp` (pass 1 reads pass 0 by alias
+`step1`) produces correct double-invert (red → cyan → red).
+`double_invert.slangp` (Source chain) byte-perfect identity over
+gradient. Real libretro `image-adjustment.slangp` (with `#include`)
+runs.
 
 ---
 
-## Phase 6 — `PassFeedback<n>` and `OriginalHistory<n>` *(not started)*
+## Phase 6 — `PassFeedback<n>` *(done)*
 
-- [ ] Detect at compile time which passes have feedback consumers
-      (search SPIR-V reflection — Phase 7 dep — for samplers named
-      `PassFeedback<n>` / `<alias>Feedback`).
-- [ ] Per feedback-producing pass: extend `pass_state` to a 2-deep ring
-      of `(out_img, out_view)`. Per frame, this frame's pass output goes
-      to slot[parity], next frame's consumer reads slot[parity ^ 1].
-      Maintain a `frame_parity` bit that flips at the end of each
-      `pipeline_run`.
-- [ ] For consumers: extra sampler binding per declared `PassFeedback<n>`
-      ref, descriptor written to point at slot[parity ^ 1] before each
-      frame.
-- [ ] Detect history depth needed for `OriginalHistory<n>`. Allocate
-      ring of N+1 input snapshots; rotate.
+- [x] Detection during sampler resolution (Phase 5/Phase 7): names
+      matching `PassFeedback<n>` or `<alias>Feedback` mark the producer
+      pass as `is_feedback_producer` and store the producer index on
+      the consumer's resolved binding.
+- [x] Per feedback-producing pass: a `feedback_img` snapshot that the
+      next frame's consumers sample from. Implemented as a copy
+      (vkCmdCopyImage out_img → feedback_img at end of frame) instead
+      of a parity-flipped ring, for code simplicity. Adds one image
+      copy per producer per frame.
+- [x] First-frame initialization: every feedback image is cleared to
+      opaque-black + transitioned to SHADER_READ_ONLY before any pass
+      runs on frame 0, so consumers reading PassFeedback<n> at frame 0
+      get deterministic zeros instead of UB.
+- [x] Layout transition coordination: end-of-frame snapshot transitions
+      out_img → TRANSFER_SRC, feedback_img → TRANSFER_DST, runs the
+      copy, then restores both. Last pass coordinates with the readback
+      path so `out_img` only transitions once.
+- [ ] **Deferred: `OriginalHistory<n>`** for n>0. The resolver currently
+      treats all OriginalHistory* as the current input frame; a future
+      pass adds an N-deep input snapshot ring sized from the highest
+      n the corpus references.
 
-**Demo:** `crt/newpixie-crt.slangp` runs end-to-end with a real
-multi-frame accumulator (ghosting trails decay over many frames, not
-just one). Frame-perfect parity vs RetroArch.
+**Verified:** `feedback.slang` (accumulator with 0.7-decay multiplier).
+Sequence: white frame → 5 black frames. Output: `255 → 178 → 125 → 87
+→ 61 → 43`. Each frame is exactly the previous output × 0.7 rounded
+down. **Multi-frame compounding accumulator works** — this is the slang
+PassFeedback semantics that ffmpeg's libplacebo filter could not
+represent at all.
 
 ---
 

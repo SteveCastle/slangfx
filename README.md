@@ -60,33 +60,43 @@ blocker. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Status
 
-Alpha. Real libretro slang shaders compile and run end-to-end through the
-full pipeline (`.slangp` → `.slang` → SPIR-V → Vulkan). Done so far:
+Beta. Real libretro slang shaders — **including the canonical
+`crt/newpixie-crt.slangp` (4 passes, multi-frame `PassFeedback`
+accumulator, 6 runtime parameters)** — compile and run end-to-end
+through the full pipeline (`.slangp` → `.slang` → SPIR-V → Vulkan)
+on Windows mingw64. Done:
 
 - **Phase 0** — scaffold + build system (Windows mingw64 + Linux + macOS).
 - **Phase 1** — Vulkan offscreen render-to-texture pipeline.
 - **Phase 2** — `.slangp` parser (full libretro syntax + 7 unit tests).
-- **Phase 3** — slang preprocessor (split `#pragma stage`, collect
-  `#pragma parameter`/`format`) + shaderc compilation, **including
-  `#include` resolution via shaderc include callbacks**, which is what
-  unblocks the libretro corpus.
-- **Phase 4** — pipeline driven by a slang shader (UBO + push constants
-  + vertex buffers + slang sampler binding convention).
-- **Phase 5 (MVP)** — multi-pass chain: per-pass framebuffer/pipeline,
-  `Source` chained pass-to-pass, per-pass scale rules + filter/wrap.
+- **Phase 3** — slang preprocessor + shaderc compilation, including
+  `#include` resolution.
+- **Phase 4** — pipeline driven by a slang shader.
+- **Phase 5** — multi-pass chain.
+- **Phase 5b** — alias bindings (`alias<i> = name`).
+- **Phase 5c** — `Pass<n>` numeric pass refs.
+- **Phase 5d** — `Original` / `OriginalSize`.
+- **Phase 6** — `PassFeedback<n>` rings: per-producer snapshot at
+  end of each frame; consumers in next frame sample the snapshot.
+  Multi-frame compounding accumulator works.
 - **Phase 7** — SPIR-V reflection: push-constant layout, UBO layout,
-  and sampler bindings recovered from the SPIR-V directly. The host
-  writes standard fields and `#pragma parameter` defaults at the
-  shader's declared offsets — no more guessing.
+  sampler bindings recovered from SPIR-V directly. The host writes
+  standard fields + `#pragma parameter` defaults at the shader's
+  declared offsets.
+- **Phase 7b** — preset-level parameter overrides applied at startup.
 
-Verified:
-- 4×4 red input → cyan via `tests/fixtures/invert.slang` (real slang
-  shader with both stages, UBO, push, Source sampler).
-- 16×16 RGB gradient through 2-pass `double_invert.slangp` →
-  byte-perfect identity (every pass writes through the chain correctly).
-- Real libretro shader `slang-shaders/misc/image-adjustment.slangp`
-  (with `#include "../../include/colorspace-tools.h"`) compiles and
-  runs without modification.
+Verified end-to-end:
+
+| Test | Result |
+|---|---|
+| `invert.slang` (1 pass, Source) | red → cyan ✓ |
+| `double_invert.slangp` (2 passes, Source chain) | red → red ✓ |
+| `brightness.slang` (param at offset 52, default 0.5) | 255 → 127 ✓ |
+| `alias_test.slangp` (pass 1 reads pass 0 by alias) | red → red ✓ |
+| `feedback.slang` (PassFeedback0 with 0.7 decay) | 255 → 178 → 125 → 87 → 61 → 43 ✓ |
+| `image-adjustment.slangp` (libretro, single pass, `#include`) | runs, all 24 push members reflected ✓ |
+| **`newpixie-crt.slangp`** (libretro, 4 passes, PassFeedback, alias chain) | **runs** ✓ |
+| Real 5s 1440×1080 video through `newpixie-crt.slangp` | 147 frames out, valid h.264 ✓ |
 
 What's left:
 
