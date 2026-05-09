@@ -48,7 +48,12 @@ if get_option('enable_gpu')
   if vulkan_sdk != ''
     vulkan_inc  = include_directories(vulkan_sdk / 'Include')
     vulkan_lib  = (host_sys == 'windows') ? 'vulkan-1' : 'vulkan'
-    shaderc_lib = (host_sys == 'windows') ? 'shaderc_combined' : 'shaderc_shared'
+    # On Windows: prefer the shared-library import (`shaderc_shared.dll`).
+    # The static `shaderc_combined.lib` is 200+ MB of optimized C++ which
+    # takes minutes to link with MinGW's ld.bfd; the shared variant links
+    # in seconds and the DLL is a small runtime dep we ship next to the
+    # binary.
+    shaderc_lib = 'shaderc_shared'
 
     vulkan_dep = declare_dependency(
       include_directories: vulkan_inc,
