@@ -65,6 +65,115 @@ static char *err_fmt(const char *fmt, ...)
 }
 
 /* -------------------------------------------------------------------------- */
+/* #include flattener — runs BEFORE the stage splitter so that `#pragma       */
+/* stage vertex` directives buried inside includes are visible to the         */
+/* splitter at the correct line position.                                     */
+/* -------------------------------------------------------------------------- */
+
+/* Forward declarations from the include-callback section below — the
+ * flattener reuses the same path-resolution + slurp helpers. */
+static char *include_dirname(const char *path);
+static char *include_join(const char *dir, const char *name);
+static char *include_slurp(const char *path, size_t *size_out);
+
+struct flat_buf { char *data; size_t n, cap; };
+
+static int fb_append(struct flat_buf *b, const char *s, size_t len)
+{
+    if (b->n + len + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->n + len + 1) cap *= 2;
+        char *t = (char *)realloc(b->data, cap);
+        if (!t) return -1;
+        b->data = t; b->cap = cap;
+    }
+    memcpy(b->data + b->n, s, len);
+    b->n += len;
+    b->data[b->n] = '\0';
+    return 0;
+}
+
+static int flatten_recurse(struct flat_buf *out, const char *src, size_t src_len,
+                           const char *file_dir, int depth, char **err)
+{
+    if (depth > 32) { if (err) *err = err_fmt("#include depth >32"); return -1; }
+
+    const char *p = src;
+    const char *end = src + src_len;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') ++p;
+        size_t line_len = (size_t)(p - line);
+        if (p < end) ++p;  /* consume LF */
+
+        /* Detect `#include "path"` or `#include <path>`. */
+        const char *q = line;
+        const char *line_end = line + line_len;
+        while (q < line_end && (*q == ' ' || *q == '\t')) ++q;
+        bool is_include = false;
+        if (q + 8 <= line_end && memcmp(q, "#include", 8) == 0) {
+            const char *r = q + 8;
+            if (r == line_end || isspace((unsigned char)*r)) is_include = true;
+        }
+
+        if (is_include) {
+            const char *r = q + 8;
+            while (r < line_end && (*r == ' ' || *r == '\t')) ++r;
+            char open = (r < line_end) ? *r : '\0';
+            char close = (open == '"') ? '"' : (open == '<') ? '>' : '\0';
+            if (close) {
+                ++r;
+                const char *path_start = r;
+                while (r < line_end && *r != close) ++r;
+                if (r < line_end) {
+                    char *rel = xstrdup_n(path_start, (size_t)(r - path_start));
+                    char *resolved = include_join(file_dir, rel);
+                    free(rel);
+                    size_t inc_n = 0;
+                    char *inc_data = include_slurp(resolved, &inc_n);
+                    if (!inc_data) {
+                        if (err) *err = err_fmt("could not open include '%s'", resolved);
+                        free(resolved);
+                        return -1;
+                    }
+                    char *inc_dir = include_dirname(resolved);
+                    /* Newline before so the included content starts on its
+                     * own source line — preserves line numbers inside it. */
+                    fb_append(out, "\n", 1);
+                    int rc = flatten_recurse(out, inc_data, inc_n, inc_dir, depth + 1, err);
+                    fb_append(out, "\n", 1);
+                    free(inc_data);
+                    free(inc_dir);
+                    free(resolved);
+                    if (rc != 0) return -1;
+                    continue;
+                }
+            }
+            /* Malformed #include — fall through and copy as-is so shaderc can
+             * complain meaningfully. */
+        }
+
+        fb_append(out, line, line_len);
+        fb_append(out, "\n", 1);
+    }
+    return 0;
+}
+
+/* Returns a heap string of `src` with all `#include "..."` directives
+ * replaced by the contents of the included files (recursive). On error
+ * returns NULL and sets *err. */
+static char *flatten_includes(const char *src, const char *base_dir, char **err)
+{
+    struct flat_buf out = {0};
+    if (flatten_recurse(&out, src, strlen(src), base_dir ? base_dir : ".",
+                        0, err) != 0) {
+        free(out.data);
+        return NULL;
+    }
+    return out.data ? out.data : xstrdup("");
+}
+
+/* -------------------------------------------------------------------------- */
 /* Source scanner: walk lines, dispatch on `#pragma <kind>` directives.       */
 /* -------------------------------------------------------------------------- */
 
@@ -476,12 +585,34 @@ static struct slang_module *compile_internal(const char *src,
     struct slang_module *mod = (struct slang_module *)calloc(1, sizeof(*mod));
     if (!mod) { if (err_out) *err_out = xstrdup("oom"); return NULL; }
 
+    /* Flatten #include directives BEFORE the stage splitter so any
+     * `#pragma stage <name>` buried inside an include file is visible
+     * to the splitter at the right line position. (Without this,
+     * libretro shaders that #include a .vertex.inc which itself
+     * contains `#pragma stage vertex` end up with the vertex main()
+     * compiled into both stage units → 'main has body twice'.) */
+    char *flat_src = NULL;
+    {
+        const char *resolve_base = include_dir;
+        char *derived = NULL;
+        if (!resolve_base && src_path) {
+            derived = include_dirname(src_path);
+            resolve_base = derived;
+        }
+        if (!resolve_base) resolve_base = ".";
+        flat_src = flatten_includes(src, resolve_base, err_out);
+        free(derived);
+        if (!flat_src) { slang_module_free(mod); return NULL; }
+    }
+
     struct stage_buf vert = {0}, frag = {0};
-    if (preprocess(src, strlen(src), &vert, &frag, mod, err_out) != 0) {
+    if (preprocess(flat_src, strlen(flat_src), &vert, &frag, mod, err_out) != 0) {
+        free(flat_src);
         free(vert.data); free(frag.data);
         slang_module_free(mod);
         return NULL;
     }
+    free(flat_src);
 
     if (vert.n == 0 || frag.n == 0) {
         if (err_out) *err_out = xstrdup(
