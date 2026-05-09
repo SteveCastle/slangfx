@@ -112,6 +112,7 @@ static const uint16_t QUAD_INDICES[6] = { 0, 1, 2,  0, 2, 3 };
 struct pass_state {
     struct slang_module *mod;
     uint32_t out_w, out_h;
+    VkFormat format;        /* per-pass output / framebuffer format */
 
     /* The pass's framebuffer image (= this pass's output, = next pass's
      * Source). Always created with COLOR_ATTACHMENT + SAMPLED + TRANSFER_SRC
@@ -134,6 +135,15 @@ struct pass_state {
 
     VkRenderPass   render_pass;
     VkFramebuffer  framebuffer;
+
+    /* Per-pass UBO. Many slang shaders put SourceSize / OriginalSize /
+     * OutputSize and even runtime parameters in the std140 UBO instead of
+     * the push-constant block. We allocate one host-visible UBO buffer per
+     * pass and re-populate it each frame at the offsets reflection found. */
+    VkBuffer       ubo_buf;
+    VkDeviceMemory ubo_mem;
+    void          *ubo_ptr;
+    size_t         ubo_size;       /* allocated bytes */
 
     VkDescriptorSetLayout dset_layout;
     VkPipelineLayout      pipe_layout;
@@ -374,6 +384,36 @@ static VkSamplerAddressMode wrap_to_vk(enum slangp_wrap_mode w)
     }
 }
 
+/* Resolve a pass's framebuffer format from its slangp directives.
+ * Precedence: explicit fbo_format > srgb_framebuffer / float_framebuffer
+ * flags > default (R8G8B8A8_UNORM). Float framebuffers are critical for
+ * shaders like ntsc-pass1 that produce signals with negative AC components
+ * — without them the modulated signal clamps at 0 and downstream
+ * demodulation produces black. */
+static VkFormat resolve_pass_format(const struct slangp_pass *pp)
+{
+    if (!pp) return VK_FORMAT_R8G8B8A8_UNORM;
+    if (pp->fbo_format != SLANGP_FORMAT_DEFAULT) {
+        switch (pp->fbo_format) {
+            case SLANGP_FORMAT_R8_UNORM:            return VK_FORMAT_R8_UNORM;
+            case SLANGP_FORMAT_R8G8_UNORM:          return VK_FORMAT_R8G8_UNORM;
+            case SLANGP_FORMAT_R8G8B8A8_UNORM:      return VK_FORMAT_R8G8B8A8_UNORM;
+            case SLANGP_FORMAT_R8G8B8A8_SRGB:       return VK_FORMAT_R8G8B8A8_SRGB;
+            case SLANGP_FORMAT_R10G10B10A2_UNORM:   return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            case SLANGP_FORMAT_R16_UNORM:           return VK_FORMAT_R16_UNORM;
+            case SLANGP_FORMAT_R16_SFLOAT:          return VK_FORMAT_R16_SFLOAT;
+            case SLANGP_FORMAT_R16G16B16A16_UNORM:  return VK_FORMAT_R16G16B16A16_UNORM;
+            case SLANGP_FORMAT_R16G16B16A16_SFLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+            case SLANGP_FORMAT_R32_SFLOAT:          return VK_FORMAT_R32_SFLOAT;
+            case SLANGP_FORMAT_R32G32B32A32_SFLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+            default: break;
+        }
+    }
+    if (pp->float_framebuffer) return VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (pp->srgb_framebuffer)  return VK_FORMAT_R8G8B8A8_SRGB;
+    return VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Sampler resolution (Phase 5b/c/d + Phase 6 + Phase 8)                       */
 /* -------------------------------------------------------------------------- */
@@ -539,18 +579,19 @@ static void resolve_pass_dims(const struct slangp_pass *ps,
 /* Phase A: allocate the pass's output framebuffer image + its sampler. */
 static int alloc_pass_image(struct slang_pipeline *p, struct pass_state *ps,
                             const struct slangp_pass *ppass,
-                            uint32_t out_w, uint32_t out_h, char **err_out)
+                            uint32_t out_w, uint32_t out_h,
+                            VkFormat format, char **err_out)
 {
     ps->out_w = out_w;
     ps->out_h = out_h;
-    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
-    if (create_image(p, out_w, out_h, FMT,
+    ps->format = format;
+    if (create_image(p, out_w, out_h, format,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT |
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      &ps->out_img, &ps->out_mem, err_out) != 0) goto fail;
-    ps->out_view = create_view(p->dev, ps->out_img, FMT);
+    ps->out_view = create_view(p->dev, ps->out_img, format);
     if (!ps->out_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (pass out)"); goto fail; }
 
     VkSamplerCreateInfo sci = {
@@ -577,11 +618,13 @@ fail: return -1;
 static int alloc_feedback_image(struct slang_pipeline *p, struct pass_state *ps,
                                 char **err_out)
 {
-    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
-    if (create_image(p, ps->out_w, ps->out_h, FMT,
+    /* Match the producer's output format so vkCmdCopyImage at end-of-frame
+     * works without format-mismatch validation errors. */
+    VkFormat fmt = ps->format ? ps->format : VK_FORMAT_R8G8B8A8_UNORM;
+    if (create_image(p, ps->out_w, ps->out_h, fmt,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      &ps->feedback_img, &ps->feedback_mem, err_out) != 0) return -1;
-    ps->feedback_view = create_view(p->dev, ps->feedback_img, FMT);
+    ps->feedback_view = create_view(p->dev, ps->feedback_img, fmt);
     if (!ps->feedback_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (feedback)"); return -1; }
     return 0;
 }
@@ -592,7 +635,7 @@ static int build_pass_pipeline(struct slang_pipeline *p, struct pass_state *ps,
                                const struct resolved_binding *bindings,
                                size_t num_bindings, char **err_out)
 {
-    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat FMT = ps->format ? ps->format : VK_FORMAT_R8G8B8A8_UNORM;
 
     /* Render pass. */
     VkAttachmentDescription att = {
@@ -746,6 +789,27 @@ static int build_pass_pipeline(struct slang_pipeline *p, struct pass_state *ps,
         goto fail;
     }
 
+    /* Allocate per-pass UBO. Sized to the max of (reflected UBO size,
+     * sizeof(slang_ubo)) so we always have at least the legacy MVP slot
+     * available, and rounded up to multiples of 16 for std140 safety. */
+    {
+        size_t need = ps->mod ? ps->mod->ubo_total_size : 0;
+        if (need < sizeof(struct slang_ubo)) need = sizeof(struct slang_ubo);
+        if (need < 256) need = 256;       /* baseline; some shaders push more */
+        need = (need + 15) & ~(size_t)15;
+        ps->ubo_size = need;
+        if (create_buffer(p, need, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          &ps->ubo_buf, &ps->ubo_mem, &ps->ubo_ptr,
+                          err_out) != 0) goto fail;
+        /* Default contents: identity MVP for shaders that need only that.
+         * The per-frame loop overwrites with reflected layout when present. */
+        memset(ps->ubo_ptr, 0, need);
+        struct slang_ubo identity = { .MVP = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 } };
+        memcpy(ps->ubo_ptr, &identity, sizeof(identity));
+    }
+
     /* Allocate descriptor set + write. */
     VkDescriptorSetAllocateInfo dsai = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -757,7 +821,7 @@ static int build_pass_pipeline(struct slang_pipeline *p, struct pass_state *ps,
 
     /* Descriptor writes: UBO + each sampler. We use a heap array because the
      * per-image descriptor info structs need to outlive the call. */
-    VkDescriptorBufferInfo dbi = { .buffer = p->ubo, .offset = 0, .range = sizeof(struct slang_ubo) };
+    VkDescriptorBufferInfo dbi = { .buffer = ps->ubo_buf, .offset = 0, .range = ps->ubo_size };
     VkDescriptorImageInfo *dii = (VkDescriptorImageInfo *)calloc(num_bindings, sizeof(*dii));
     VkWriteDescriptorSet  *writes = (VkWriteDescriptorSet *)calloc(1 + num_bindings, sizeof(*writes));
     if (!writes || (num_bindings > 0 && !dii)) {
@@ -911,7 +975,21 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
             else       { pw = output_w; ph = output_h; }
             if (i == n_passes - 1) { pw = output_w; ph = output_h; }
 
-            if (alloc_pass_image(p, ps, ppass, pw, ph, err_out) != 0) goto fail;
+            /* Format from preset directives. The final pass is forced to
+             * R8G8B8A8_UNORM because the readback path memcpy's the buffer
+             * straight to host RGBA bytes — float / 16-bit formats would
+             * produce garbage on stdout. */
+            VkFormat pfmt = (i == n_passes - 1) ? VK_FORMAT_R8G8B8A8_UNORM
+                                                 : resolve_pass_format(ppass);
+            if (getenv("VFSLANG_DEBUG_FORMAT")) {
+                fprintf(stderr,
+                        "[pass %zu] %ux%u  format=%d  float_fb=%d  srgb_fb=%d  fbo_fmt=%d\n",
+                        i, pw, ph, (int)pfmt,
+                        ppass ? ppass->float_framebuffer : 0,
+                        ppass ? ppass->srgb_framebuffer  : 0,
+                        ppass ? (int)ppass->fbo_format    : 0);
+            }
+            if (alloc_pass_image(p, ps, ppass, pw, ph, pfmt, err_out) != 0) goto fail;
 
             prev_w = pw; prev_h = ph;
         }
@@ -1159,73 +1237,131 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         pc.output_size[2] = 1.0f / (float)ps->out_w;
         pc.output_size[3] = 1.0f / (float)ps->out_h;
 
-        /* Build a push-constant blob honoring this shader's reflected layout.
-         * For each declared push field we look up its name and write the
-         * matching standard-field bytes at the right offset. Fields the
-         * shader didn't declare are simply not written. After the standard
-         * fields, every #pragma parameter default is written at its
-         * resolved offset. */
+        /* Helper: write `value` (`size` bytes) into `blob` at the offset
+         * where `name` was found in `fields`. The `is_push` flag tracks the
+         * high-water mark of bytes written so we can size the
+         * vkCmdPushConstants call. No-op when name not found. */
+        #define WRITE_FIELD(blob, blob_size, fields, n_fields, is_push, name_str, value_ptr, value_size) \
+            do {                                                                                          \
+                for (size_t _i = 0; _i < (n_fields); ++_i) {                                              \
+                    const struct slang_push_field *_f = &(fields)[_i];                                    \
+                    if (_f->name && strcmp(_f->name, (name_str)) == 0) {                                  \
+                        if ((size_t)_f->offset + (value_size) <= (blob_size))                             \
+                            memcpy((blob) + _f->offset, (value_ptr), (value_size));                       \
+                        if ((is_push) && (size_t)_f->offset + (value_size) > push_size_used)              \
+                            push_size_used = _f->offset + (value_size);                                   \
+                        break;                                                                            \
+                    }                                                                                    \
+                }                                                                                        \
+            } while (0)
+
+        /* Standard slang field values for this pass. */
+        int32_t  frame_dir = 1;
+        uint32_t rot       = 0;
+
+        /* Build a push-constant blob AND write the per-pass UBO contents
+         * honoring this shader's reflected layout. Each field is written to
+         * push OR ubo depending on which reflected struct declared it
+         * (slang shaders are free to put SourceSize, FrameCount,
+         * parameters, etc. in either; ntsc-pass2 uses the UBO). */
         memset(push_blob, 0, sizeof(push_blob));
         push_size_used = 0;
-        if (ps->mod && ps->mod->num_push_fields > 0) {
-            for (size_t f = 0; f < ps->mod->num_push_fields; ++f) {
-                const struct slang_push_field *pf = &ps->mod->push_fields[f];
-                if (!pf->name || pf->offset >= sizeof(push_blob)) continue;
-                if (pf->offset > push_size_used) push_size_used = pf->offset;
-                if (!strcmp(pf->name, "SourceSize")) {
-                    if (pf->offset + 16 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, pc.source_size, 16);
-                    push_size_used = pf->offset + 16;
-                } else if (!strcmp(pf->name, "OriginalSize")) {
-                    if (pf->offset + 16 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, pc.original_size, 16);
-                    push_size_used = pf->offset + 16;
-                } else if (!strcmp(pf->name, "OutputSize")) {
-                    if (pf->offset + 16 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, pc.output_size, 16);
-                    push_size_used = pf->offset + 16;
-                } else if (!strcmp(pf->name, "FinalViewportSize")) {
-                    if (pf->offset + 16 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, pc.output_size, 16);
-                    push_size_used = pf->offset + 16;
-                } else if (!strcmp(pf->name, "FrameCount")) {
-                    if (pf->offset + 4 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, &pc.frame_count, 4);
-                    push_size_used = pf->offset + 4;
-                } else if (!strcmp(pf->name, "FrameDirection")) {
-                    int32_t dir = 1;
-                    if (pf->offset + 4 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, &dir, 4);
-                    push_size_used = pf->offset + 4;
-                } else if (!strcmp(pf->name, "Rotation")) {
-                    uint32_t rot = 0;
-                    if (pf->offset + 4 <= sizeof(push_blob))
-                        memcpy(push_blob + pf->offset, &rot, 4);
-                    push_size_used = pf->offset + 4;
-                }
-            }
-            /* Apply each #pragma parameter default at its resolved offset. */
+
+        /* Reset the per-pass UBO to identity-MVP defaults each frame. */
+        memset(ps->ubo_ptr, 0, ps->ubo_size);
+        {
+            struct slang_ubo identity = { .MVP = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 } };
+            memcpy(ps->ubo_ptr, &identity, sizeof(identity));
+        }
+
+        if (ps->mod && (ps->mod->num_push_fields > 0 || ps->mod->num_ubo_fields > 0)) {
+            /* Populate push */
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "SourceSize",         pc.source_size,   16);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "OriginalSize",       pc.original_size, 16);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "OutputSize",         pc.output_size,   16);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "FinalViewportSize",  pc.output_size,   16);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "FrameCount",         &pc.frame_count,   4);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "FrameDirection",     &frame_dir,        4);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "Rotation",           &rot,              4);
+
+            /* Populate UBO with the same standard fields if the shader
+             * declared them there. */
+            uint8_t *ubo = (uint8_t *)ps->ubo_ptr;
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "SourceSize",         pc.source_size,   16);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "OriginalSize",       pc.original_size, 16);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "OutputSize",         pc.output_size,   16);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "FinalViewportSize",  pc.output_size,   16);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "FrameCount",         &pc.frame_count,   4);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "FrameDirection",     &frame_dir,        4);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "Rotation",           &rot,              4);
+
+            /* Apply each #pragma parameter default at its resolved offset.
+             * Try push first; if not found there, try the UBO. */
             for (size_t f = 0; f < ps->mod->num_params; ++f) {
                 const struct slang_param *pp = &ps->mod->params[f];
-                if (pp->push_offset == 0 && pp->name) {
-                    /* unresolved (no matching push field name) — skip */
-                    continue;
+                if (!pp->name) continue;
+                bool wrote_push = false;
+                for (size_t k = 0; k < ps->mod->num_push_fields; ++k) {
+                    if (ps->mod->push_fields[k].name &&
+                        strcmp(ps->mod->push_fields[k].name, pp->name) == 0) {
+                        uint32_t off = ps->mod->push_fields[k].offset;
+                        if (off + 4 <= sizeof(push_blob)) {
+                            memcpy(push_blob + off, &pp->default_value, 4);
+                            if (off + 4 > push_size_used) push_size_used = off + 4;
+                            wrote_push = true;
+                        }
+                        break;
+                    }
                 }
-                if (pp->push_offset + 4 > sizeof(push_blob)) continue;
-                memcpy(push_blob + pp->push_offset, &pp->default_value, 4);
-                if (pp->push_offset + 4 > push_size_used)
-                    push_size_used = pp->push_offset + 4;
+                if (!wrote_push) {
+                    for (size_t k = 0; k < ps->mod->num_ubo_fields; ++k) {
+                        if (ps->mod->ubo_fields[k].name &&
+                            strcmp(ps->mod->ubo_fields[k].name, pp->name) == 0) {
+                            uint32_t off = ps->mod->ubo_fields[k].offset;
+                            if ((size_t)off + 4 <= ps->ubo_size)
+                                memcpy(ubo + off, &pp->default_value, 4);
+                            break;
+                        }
+                    }
+                }
             }
         } else {
-            /* No reflection (e.g. built-in passthrough): use the legacy
-             * fixed slang_push struct exactly. */
+            /* No reflection (built-in passthrough fallback): legacy push. */
             memcpy(push_blob, &pc, sizeof(pc));
             push_size_used = sizeof(pc);
         }
-        /* Round up to 4 (Vulkan requires 4-byte aligned push range). */
         push_size_used = (push_size_used + 3) & ~3u;
         if (push_size_used == 0) push_size_used = 4;
         if (push_size_used > sizeof(push_blob)) push_size_used = sizeof(push_blob);
+        #undef WRITE_FIELD
 
         VkClearValue clear = { .color = { .float32 = { 0, 0, 0, 1 } } };
         VkRenderPassBeginInfo rpbi = {
@@ -1342,6 +1478,8 @@ static void destroy_pass(VkDevice dev, struct pass_state *ps)
     if (ps->dset_layout)   vkDestroyDescriptorSetLayout(dev, ps->dset_layout, NULL);
     if (ps->framebuffer)   vkDestroyFramebuffer(dev, ps->framebuffer, NULL);
     if (ps->render_pass)   vkDestroyRenderPass(dev, ps->render_pass, NULL);
+    if (ps->ubo_mem)       { vkUnmapMemory(dev, ps->ubo_mem); vkFreeMemory(dev, ps->ubo_mem, NULL); }
+    if (ps->ubo_buf)       vkDestroyBuffer(dev, ps->ubo_buf, NULL);
     if (ps->sampler)       vkDestroySampler(dev, ps->sampler, NULL);
     if (ps->feedback_view) vkDestroyImageView(dev, ps->feedback_view, NULL);
     if (ps->feedback_img)  vkDestroyImage(dev, ps->feedback_img, NULL);
