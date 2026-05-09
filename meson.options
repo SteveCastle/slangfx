@@ -1,0 +1,9 @@
+option('enable_gpu',
+  type: 'boolean',
+  value: false,
+  description: 'Enable Vulkan + shaderc dependencies. Off in Phase 0 so the binary builds with just a C compiler. Required from Phase 1.')
+
+option('vulkan_sdk',
+  type: 'string',
+  value: '',
+  description: 'Override Vulkan SDK install path (Windows). Defaults to the VULKAN_SDK environment variable.')

@@ -1,184 +1,139 @@
 # Architecture
 
-Three layers, plus the ffmpeg integration shell.
+## IO model
+
+`vfslang` is a standalone process that reads raw RGBA8 frames from stdin
+and writes processed frames to stdout. ffmpeg orchestrates everything
+around it via pipes: decode → rawvideo → vfslang → rawvideo → encode.
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│  ffmpeg (libavfilter host)                                             │
-│                                                                        │
-│   ┌──────────────────────────────────────────────────────────────┐    │
-│   │  vf_slang.c    AVFilter registration + frame in/out          │    │
-│   └────────────────────┬─────────────────────────────────────────┘    │
-│                        │                                              │
-└────────────────────────┼──────────────────────────────────────────────┘
-                         │
-            ┌────────────┴───────────┐
-            │ slang_pipeline (Vulkan │
-            │ device, descriptor &   │
-            │ render-pass plumbing)  │
-            └────────────┬───────────┘
-                         │
-                ┌────────┴────────┐
-                │                 │
-        ┌───────┴──────┐   ┌──────┴────────┐
-        │  slangp.c    │   │ slang_compile │
-        │  preset      │   │ (slang -> SPV │
-        │  parser      │   │  via shaderc) │
-        └──────────────┘   └───────────────┘
+┌─────────────┐  RGBA pipe  ┌─────────┐  RGBA pipe  ┌─────────────┐
+│   ffmpeg    │ ──────────► │ vfslang │ ──────────► │   ffmpeg    │
+│  (decode)   │             │ (GPU)   │             │  (encode)   │
+└─────────────┘             └─────────┘             └─────────────┘
+       ▲                                                   │
+       │                                                   ▼
+   in.mp4                                              out.mp4
 ```
 
-## Components
+This bypasses ffmpeg's missing plugin ABI: external libavfilter filters
+cannot link the internal `ff_*` helpers, so we don't try. We only depend
+on ffmpeg as a runtime executable that anyone already has. The libavfilter
+patch for upstream submission becomes a Phase-10 packaging task, not a
+build dependency.
+
+`wrappers/vfslang.py` automates the orchestration: probes input dims,
+spawns the three processes, passes audio through unchanged from the source
+container.
+
+## Internal components
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  src/vf_slang.c            stdin/stdout frame loop + arg parsing │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │
+                  ┌──────────────┴──────────────┐
+                  │ slang_pipeline (Vulkan      │
+                  │ device, descriptor sets,    │
+                  │ render passes, ring buffers)│
+                  └──────────────┬──────────────┘
+                                 │
+                ┌────────────────┴────────────────┐
+                │                                 │
+        ┌───────┴────────┐               ┌────────┴────────┐
+        │  slangp.c      │               │ slang_compile.c │
+        │  preset parser │               │ slang→SPIR-V    │
+        │                │               │ via shaderc     │
+        └────────────────┘               └─────────────────┘
+```
 
 ### `slangp.c` — preset parser
 
 Parses libretro `.slangp` INI-format presets. Output: a `slangp_preset`
-struct holding an array of `slangp_pass` (one per shader stage), the textures
-table, and runtime parameter overrides.
+struct holding an array of `slangp_pass` (one per shader stage), the
+external textures table, and runtime parameter overrides.
 
-Key fields per pass:
-- `path` — file path to the `.slang` shader (relative paths resolved
-  against the preset directory)
-- `alias` — optional name used to bind this pass's output as a sampler in
-  later passes (e.g. `accum1`)
-- `scale_type_x/y` — `source` / `viewport` / `absolute` — controls the
-  framebuffer dimensions of this pass's output
-- `scale_x/y` — multiplier applied to the chosen scale type
-- `filter_linear` — bilinear vs nearest sampling on this pass's output
-- `mipmap_input` — whether downstream samplers see mipmaps
-- `wrap_mode` — `clamp_to_border` / `clamp_to_edge` / `repeat` / `mirrored_repeat`
-- `frame_count_mod` — applied to the FrameCount push constant exposed to
-  the shader
-- `fbo_format` — pixel format for this pass's framebuffer
-  (`R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, etc.)
+Per-pass fields: shader path, alias, `scale_type[_x|_y]`, `scale[_x|_y]`,
+`filter_linear`, `mipmap_input`, `wrap_mode`, `frame_count_mod`,
+`fbo_format`. Top-level: `textures = "name1;name2"` declarations and
+`parameters = "knob1;knob2"` overrides.
 
-Top-level fields:
-- `textures` — list of `(name, path, filter_linear, mipmap, wrap_mode)`
-  for external image bindings (CRT bezel art, look-up tables, etc.)
-- `parameters` — overrides for `#pragma parameter` declared values
-
-Parser is hand-written; the format is small enough to not warrant pulling
-in an INI library.
+The parser is hand-written; the format is small enough not to warrant an
+INI library dependency.
 
 ### `slang_compile.c` — slang → SPIR-V
 
-Runs each `.slang` file through libretro's slang preprocessor (or our own
-re-implementation of its preprocessing rules) to produce two GLSL strings,
-one per shader stage (`#pragma stage vertex` / `#pragma stage fragment`).
-Each is then compiled to SPIR-V by `shaderc` (libshaderc is bundled with
-the Vulkan SDK and most distros).
+Runs each `.slang` file through libretro's slang preprocessor (port the
+relevant ~600 lines of `libretro/glslang/glslang/glslang_util_cxx.cpp`)
+to produce two GLSL strings, one per Vulkan stage (`#pragma stage vertex`
+/ `#pragma stage fragment`). Each is compiled to SPIR-V by `shaderc`
+(libshaderc ships with the Vulkan SDK).
 
-Output per shader: `slang_module`
-- `vert_spirv`, `frag_spirv` — bytecode arrays
-- `push_constant_layout` — extracted `Push` block (offset/size of each field)
-- `ubo_layout` — extracted `UBO` block (set 0, binding 0)
-- `samplers[]` — declared `sampler2D` references (Source, Original,
-  PassFeedback*, OriginalHistory*, Pass<n>, alias names, declared textures)
-- `parameters[]` — declared `#pragma parameter` knobs (name, default, min,
-  max, step)
-
-Notes on the slang dialect (see `docs/slang_format.md` for the full spec
-notes):
-- Always `#version 450`
-- Uses `layout(push_constant) uniform Push { ... }` for per-pass constants
-- `layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; ... }`
-  for the global uniform block
-- Texture samplers at `set = 0, binding = N` for N >= 2 (binding 1 is
-  conventionally reserved)
+Output per shader: `slang_module` containing the bytecode plus reflected
+push-constant layout, UBO layout, sampler bindings (`Source`, `Original`,
+`PassFeedback<N>`, `OriginalHistory<N>`, `Pass<n>`, declared aliases,
+external textures), and parameter declarations.
 
 ### `slang_pipeline.c` — Vulkan dispatch
 
 Owns the Vulkan device, descriptor pools, render passes, and per-pass
-graphics pipelines. Handles framebuffer allocation per pass based on
-parsed scale rules. Maintains:
-- **Pass output cache** — current-frame outputs, chained by alias
+graphics pipelines. Maintains:
+
+- **Pass output cache** — current-frame outputs, chained by alias.
 - **Feedback ring buffers** — one per pass that has its output read as
-  `PassFeedback<n>` somewhere downstream; ring of 2 textures, swapped each
-  frame so frame N can read frame N-1's pass output
-- **Original history ring** — input frame history (`OriginalHistory0..N`)
-  exposed to shaders that ask for it
+  `PassFeedback<n>` somewhere downstream; ring of 2 textures, swapped
+  each frame so frame N can read frame N-1's output.
+- **Original history ring** — input frame history exposed as
+  `OriginalHistory<0..N>`.
 
 Per-frame loop:
-1. Upload incoming AVFrame to the input texture (`Source` for pass 0).
-2. Update `FrameCount` push constant (multiplied by per-pass
-   `frame_count_mod`).
-3. For each pass in order:
-   a. Bind input samplers — `Source` (= previous pass output or original
-      input), `Original` (= input frame), aliases, history, feedback,
-      external textures.
-   b. Update push constants with `SourceSize`, `OriginalSize`, `OutputSize`,
-      `FrameCount`, and any parameter values.
-   c. Draw a fullscreen triangle into this pass's framebuffer.
-4. Read back the last pass's output to a host AVFrame.
-5. Advance feedback rings (this pass's current output becomes next frame's
-   `PassFeedback<n>`), advance original history.
+1. Upload incoming RGBA bytes to the input texture (`Source` for pass 0).
+2. Update `FrameCount` push constant (multiplied by `frame_count_mod`).
+3. For each pass:
+   - Bind input samplers — `Source`, `Original`, aliases, history,
+     feedback, external textures.
+   - Update push constants with `SourceSize`, `OriginalSize`,
+     `OutputSize`, `FrameCount`, parameter values.
+   - Draw a fullscreen triangle into this pass's framebuffer.
+4. Read back the last pass's output to the host RGBA buffer for stdout.
+5. Advance feedback rings (this pass's current output becomes next
+   frame's `PassFeedback<n>`); rotate `OriginalHistory`.
 
-### `vf_slang.c` — ffmpeg integration
+### `vf_slang.c` — frame loop
 
-Standard `AVFilter` boilerplate:
-- `init()` — parse preset path option, allocate `slang_pipeline`.
-- `query_formats()` — declare we accept RGB and YUV (color conversion
-  handled internally; slang shaders run in RGB).
-- `config_input()` — once we know the input dimensions, set up Vulkan
-  framebuffers per pass.
-- `filter_frame()` — run the pipeline on one AVFrame, push the result
-  downstream.
-- `uninit()` — tear down Vulkan resources.
+Parses CLI args (`--preset`, `--width`, `--height`, optional `--params` /
+`--frame-history`), opens the preset, builds the pipeline, then in a hot
+loop:
 
-Filter options:
-- `preset` — path to `.slangp` file
-- `params` — `key=value,key2=value2` overrides for `#pragma parameter`
-  knobs
-- `frame_history` — max history depth to keep (default: derived from
-  shaders, capped at 8)
-
-## Per-frame data flow
-
+```c
+while (fread(frame_in, 1, frame_bytes, stdin) == frame_bytes) {
+    slang_pipeline_run(pipeline, frame_in, frame_out);
+    fwrite(frame_out, 1, frame_bytes, stdout);
+}
 ```
-AVFrame (NV12 or RGB)
-   │
-   │ ① upload to input image
-   ▼
-[Source / Original = input texture]
-   │
-   │ ② pass 0 reads Source + (optional aliases / history / feedback)
-   ▼
-[pass 0 output framebuffer = alias 'accum1' if declared]
-   │
-   │ ③ pass 1 reads pass 0 output as 'Source', plus alias 'accum1'
-   ▼
-[pass 1 output framebuffer]
-   │
-   │ ... etc for each pass ...
-   ▼
-[final pass output]
-   │
-   │ ④ readback to AVFrame
-   ▼
-AVFrame out
 
-After step 3 each frame:
-  [pass N output] → [feedback ring slot for next frame's PassFeedback<N>]
-  [Original]      → [history ring slot for next frame's OriginalHistory<0>]
-```
+Stdin/stdout are forced to binary mode on Windows so RGBA bytes aren't
+mangled by CRLF translation.
 
 ## Memory model
 
-- Vulkan resources allocated once per filter instance at `config_input`.
+- Vulkan resources allocated once at pipeline creation.
 - Per-frame allocations: only the upload staging + readback staging
   buffers (re-used).
 - Framebuffer textures use `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
   VK_IMAGE_USAGE_SAMPLED_BIT`.
-- Feedback rings are flipped via descriptor set update (no copy).
+- Feedback rings are flipped via descriptor-set updates (no copy).
 
 ## Testing strategy
 
 Three layers:
-1. **`tests/test_slangp_parse.c`** — parse fixtures from `tests/fixtures/`,
-   verify struct contents.
-2. **Single-pass shader against synthetic input** — feed a known image
-   (gradient, color block) through a one-pass shader, verify output
-   matches a CPU reference.
+
+1. **`tests/test_slangp_parse.c`** — parses fixtures from
+   `tests/fixtures/`, asserts parsed struct contents match expected.
+2. **Single-pass shader against synthetic input** — once GPU is on, feed
+   a known image (gradient, color block) through a one-pass shader,
+   diff against a CPU reference.
 3. **Parity vs RetroArch** — compile select `slang-shaders/` presets
-   through both this filter and RetroArch's `ffmpeg_libretro` core,
-   diff the resulting frames. Threshold acceptance to within rounding
-   error.
+   through both this filter and RetroArch's `ffmpeg_libretro` core, diff
+   resulting frames. Threshold acceptance to within rounding error.

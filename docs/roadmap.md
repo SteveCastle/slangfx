@@ -11,15 +11,20 @@ demo and a checked-in test fixture.
 
 ## Phase 0 — Scaffold *(current)*
 
-- [x] Repo layout, README, LICENSE, .gitignore
-- [x] `meson.build` skeleton declaring deps (Vulkan SDK, shaderc,
-      libavfilter, libavutil)
-- [x] Source stubs with documented interfaces
-- [x] `docs/architecture.md`, `docs/slang_format.md`
+- [x] Repo layout, README, LICENSE, .gitignore, .gitattributes
+- [x] `meson.build` (Vulkan + shaderc gated behind `-Denable_gpu=true`,
+      off by default so Phase 0 builds with just a C compiler).
+- [x] Source stubs with documented interfaces.
+- [x] `docs/architecture.md`, `docs/roadmap.md`, `docs/slang_format.md`
+- [x] `wrappers/vfslang.py` for ffmpeg ↔ vfslang ↔ ffmpeg orchestration.
 
-**Demo:** `meson setup build && meson compile -C build` produces a stub
-`libvfslang.so` that registers a `slang` filter which currently no-ops
-(passes input through unchanged). `ffmpeg -filters | grep slang` lists it.
+**Demo:** `meson setup build && meson compile -C build` produces a working
+`vfslang` binary. It reads RGBA frames from stdin and writes them to
+stdout (currently identity copy, the work happens in subsequent phases).
+`vfslang --help` prints usage. `wrappers/vfslang.py -i in.mp4 --preset
+foo.slangp -o out.mp4` runs end-to-end (with the preset parser stubbed
+so it'll bail with a friendly "not yet implemented (Phase 2)" message —
+proving the whole pipe pipeline works).
 
 ---
 
@@ -159,18 +164,23 @@ intermediate format conversion stage.
 
 ---
 
-## Phase 10 — Polish + parity sweep
+## Phase 10 — Polish + parity sweep + libavfilter patch
 
 - [ ] Run a representative subset of `libretro/slang-shaders` (CRT,
-      scanlines, ntsc, sharpen) through both this filter and RetroArch.
+      scanlines, ntsc, sharpen) through both this binary and RetroArch.
       Build a perceptual-diff dashboard.
 - [ ] Resolve any remaining behavioral divergences from the reference.
-- [ ] Document filter usage on the `ffmpeg-user` ML; submit
-      patchset for upstream review (libavfilter accepts external GPU
-      filters; precedent: `vf_libplacebo`, `vf_vulkan`, `vf_ngl`).
+- [ ] Wrap the same `slang_pipeline` core into a `libavfilter` filter
+      (`vf_slang.c` re-using all of `slangp.c`, `slang_compile.c`,
+      `slang_pipeline.c`). The pipeline code stays the same; only the
+      frame-source/sink shell changes from stdin/stdout to
+      `AVFilterContext`. Submit upstream patchset; precedent:
+      `vf_libplacebo`, `vf_vulkan`, `vf_ngl`.
 
 **Demo:** `vf_slang` ships in ffmpeg HEAD as a default-built filter on
-systems where Vulkan + shaderc are detected by `configure`.
+systems where Vulkan + shaderc are detected by `configure`. The
+standalone binary remains as a pip-installable / homebrew-able tool for
+people on older ffmpeg versions.
 
 ---
 
