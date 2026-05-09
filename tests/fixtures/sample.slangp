@@ -1,0 +1,25 @@
+# Minimal multi-pass preset used as a parser fixture.
+# Mirrors the shape of crt/newpixie-crt.slangp without the actual shader files.
+
+shaders = 2
+
+shader0 = shaders/identity.slang
+alias0 = step1
+scale0 = 1.0
+scale_type0 = source
+filter_linear0 = true
+wrap_mode0 = clamp_to_edge
+
+shader1 = shaders/identity.slang
+filter_linear1 = false
+scale_type1 = viewport
+scale1 = 1.0
+
+# External textures table (Phase 8).
+textures = "lut1"
+lut1 = textures/lut.png
+lut1_linear = true
+lut1_wrap_mode = clamp_to_border
+
+# Runtime parameter overrides.
+some_knob = 0.42

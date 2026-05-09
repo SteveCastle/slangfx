@@ -1,0 +1,24 @@
+# Meson build dirs
+build/
+builddir/
+.muon/
+
+# Generated SPIR-V (we ship sources, not artifacts)
+*.spv
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.cache/
+compile_commands.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local notes / scratch
+TODO.local.md
+*.local.*
+scratch/
