@@ -60,12 +60,48 @@ blocker. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Status
 
-Pre-alpha. Phase 0 is complete: the build system works on Windows + Linux,
-the binary compiles and runs end-to-end (currently as an identity copy), and
-the component interfaces (`slangp.h`, `slang_compile.h`, `slang_pipeline.h`)
-are stubbed and documented. Phase 1 brings up the Vulkan device and replaces
-the identity copy with a real GPU dispatch. See
-[`docs/roadmap.md`](docs/roadmap.md) for the phased plan.
+Alpha. Real libretro slang shaders compile and run end-to-end through the
+full pipeline (`.slangp` → `.slang` → SPIR-V → Vulkan). Done so far:
+
+- **Phase 0** — scaffold + build system (Windows mingw64 + Linux + macOS).
+- **Phase 1** — Vulkan offscreen render-to-texture pipeline.
+- **Phase 2** — `.slangp` parser (full libretro syntax + 7 unit tests).
+- **Phase 3** — slang preprocessor (split `#pragma stage`, collect
+  `#pragma parameter`/`format`) + shaderc compilation, **including
+  `#include` resolution via shaderc include callbacks**, which is what
+  unblocks the libretro corpus.
+- **Phase 4** — pipeline driven by a slang shader (UBO + push constants
+  + vertex buffers + slang sampler binding convention).
+- **Phase 5 (MVP)** — multi-pass chain: per-pass framebuffer/pipeline,
+  `Source` chained pass-to-pass, per-pass scale rules + filter/wrap.
+
+Verified:
+- 4×4 red input → cyan via `tests/fixtures/invert.slang` (real slang
+  shader with both stages, UBO, push, Source sampler).
+- 16×16 RGB gradient through 2-pass `double_invert.slangp` →
+  byte-perfect identity (every pass writes through the chain correctly).
+- Real libretro shader `slang-shaders/misc/image-adjustment.slangp`
+  (with `#include "../../include/colorspace-tools.h"`) compiles and
+  runs without modification.
+
+What's left:
+
+- **Phase 5b/c/d** — alias / `Pass<n>` / `Original` sampler bindings
+  (incremental on top of the existing chain).
+- **Phase 6** — `PassFeedback<n>` ring buffers (multi-frame compounding
+  accumulator). 2-deep ring per producer; flip per frame.
+- **Phase 7** *(top priority)* — SPIR-V reflection so push-constant
+  offsets, UBO offsets, and sampler bindings are read from the shader
+  rather than guessed by host convention. Without this, parameters
+  read zero (which is why `image-adjustment` output looks wrong even
+  though the shader runs).
+- **Phase 8** — external textures (PNG via vendored stb_image).
+- **Phase 9** — YUV input/output + zero-copy `AV_PIX_FMT_VULKAN` path.
+- **Phase 10** — corpus parity vs RetroArch + libavfilter patch
+  (re-using the same `slangp/slang_compile/slang_pipeline` core wrapped
+  in a `vf_slang.c` filter).
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the per-phase plan.
 
 ## Building
 

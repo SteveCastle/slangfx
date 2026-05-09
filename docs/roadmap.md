@@ -9,11 +9,10 @@ demo and a checked-in test fixture.
 
 ---
 
-## Phase 0 — Scaffold *(current)*
+## Phase 0 — Scaffold *(done)*
 
 - [x] Repo layout, README, LICENSE, .gitignore, .gitattributes
-- [x] `meson.build` (Vulkan + shaderc gated behind `-Denable_gpu=true`,
-      off by default so Phase 0 builds with just a C compiler).
+- [x] `meson.build` (Vulkan + shaderc gated behind `-Denable_gpu=true`).
 - [x] Source stubs with documented interfaces.
 - [x] `docs/architecture.md`, `docs/roadmap.md`, `docs/slang_format.md`
 - [x] `wrappers/vfslang.py` for ffmpeg ↔ vfslang ↔ ffmpeg orchestration.
@@ -28,113 +27,165 @@ proving the whole pipe pipeline works).
 
 ---
 
-## Phase 1 — Vulkan device + single SPIR-V dispatch
+## Phase 1 — Vulkan device + single SPIR-V dispatch *(done)*
 
-- [ ] Vulkan instance + device creation. Pick first discrete GPU.
-- [ ] Swapchainless. We render to offscreen images.
-- [ ] Allocate one input image (`VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-      VK_IMAGE_USAGE_SAMPLED_BIT`) and one output image.
-- [ ] Render pass, fullscreen-triangle vertex shader (hardcoded), wire one
-      hardcoded fragment shader (e.g. invert) compiled to SPIR-V at build
-      time.
-- [ ] `filter_frame` uploads the AVFrame, dispatches, reads back.
-- [ ] No slang parsing yet — just prove the GPU loop works.
+- [x] VkInstance + VkDevice + queue + memory properties cache.
+- [x] Offscreen render-to-texture (no swapchain).
+- [x] Input image (`TRANSFER_DST + SAMPLED`); output image
+      (`COLOR_ATTACHMENT + TRANSFER_SRC`).
+- [x] Render pass, framebuffer, sampler, descriptor pool/set.
+- [x] Fullscreen-triangle vertex shader + passthrough fragment shader
+      (built-in slang strings compiled through shaderc at startup).
+- [x] `slang_pipeline_run`: upload via staging buffer, dispatch, readback.
 
-**Demo:** `ffmpeg -i in.mp4 -vf slang=mode=invert out.mp4` produces a
-color-inverted clip. Verify against reference.
-
----
-
-## Phase 2 — `.slangp` parser
-
-- [ ] Hand-written INI-style parser in `slangp.c`.
-- [ ] Resolve relative shader paths against the preset directory.
-- [ ] Populate `slangp_preset` (passes, textures, parameters).
-- [ ] Test fixtures in `tests/fixtures/` covering the syntactic edge
-      cases: `scale_type` per-axis vs uniform, alias with special chars,
-      parameter overrides, multiple texture declarations, comments.
-- [ ] `tests/test_slangp_parse.c` validates parse output matches
-      hand-built expected structs.
-
-**Demo:** `vfslang_dump_preset crt/newpixie-crt.slangp` prints the parsed
-struct. Diff against an expected golden file.
+**Verified:** 4×4 red input → byte-perfect red output (passthrough
+shader); 16×16 RGB gradient → byte-perfect gradient out, all sample
+positions correct.
 
 ---
 
-## Phase 3 — slang → SPIR-V via shaderc
+## Phase 2 — `.slangp` parser *(done)*
 
-- [ ] `slang_compile.c` runs each `.slang` through libretro's slang
-      preprocessor (port the relevant parts of `libretro/glslang/glslang`
-      in `glslang_util_cxx.cpp`, ~600 lines, MIT-compatible).
-      Alternative: invoke their `glslang` binary as a subprocess for v1.
-- [ ] Resulting GLSL strings (one vertex, one fragment) are fed to
-      `shaderc_compile_into_spv` with target `vulkan-1-3, spv-1-6`.
-- [ ] SPIRV-Cross reflection (or our own MSL-like parsing) populates
-      `push_constant_layout` and `ubo_layout`.
-- [ ] Track each declared sampler by binding number and name so we can
-      hook them up in the pipeline phase.
-
-**Demo:** `vfslang_compile crt/shaders/newpixie/blur_horiz.slang` writes
-`blur_horiz.vert.spv` and `blur_horiz.frag.spv`. Round-trip via
-`spirv-dis` matches expected.
+- [x] Hand-written INI-style lexer + key dispatcher in `slangp.c`.
+- [x] All indexed pass keys: `shader<i>, alias<i>,
+      scale[_x|_y]<i>, scale_type[_x|_y]<i>, filter_linear<i>,
+      mipmap_input<i>, wrap_mode<i>, frame_count_mod<i>,
+      srgb_framebuffer<i>, float_framebuffer<i>, fbo_format<i>`.
+- [x] `textures = "a;b"` with per-texture sub-options
+      (`<n>_linear, _wrap_mode, _mipmap`).
+- [x] `parameters = "k;l"` with float overrides.
+- [x] Comments, quoted strings, whitespace tolerance, `scale_<i>`
+      underscore typo tolerance.
+- [x] Relative path resolution against preset directory.
+- [x] `tests/test_slangp_parse.c` — 7 test cases pass under `meson test`.
 
 ---
 
-## Phase 4 — Single slang shader applied to video
+## Phase 3 — slang → SPIR-V via shaderc *(done — reflection deferred to Phase 7)*
 
-- [ ] Wire phase 1 + phase 3: parse a one-pass slangp, compile its slang
-      file, build a Vulkan pipeline from the resulting SPIR-V, run it.
-- [ ] Push constants populated with `SourceSize`, `OutputSize`,
-      `FrameCount`.
-- [ ] UBO populated with identity `MVP`.
-- [ ] Single `Source` sampler bound to the input image.
+- [x] Source scanner splits on `#pragma stage vertex` / `fragment`,
+      prepends shared header to each stage buffer.
+- [x] Collects `#pragma parameter NAME "DESC" DEFAULT MIN MAX STEP`
+      into `slang_module.params`. Tolerates missing min/max/step.
+- [x] Collects `#pragma format <FMT>` into `fbo_format_pragma`.
+- [x] Each stage compiled with shaderc targeting Vulkan 1.3 / SPIR-V 1.5
+      at `optimization_level_performance`.
+- [x] **`#include` resolution** via shaderc include callbacks. Resolves
+      relative to the requesting file's directory; falls back to the
+      slang file's parent dir or an explicit `include_dir`. This is what
+      unblocks the libretro corpus.
+- [ ] **Deferred (Phase 7):** SPIR-V reflection to populate
+      `push_constant_layout` and `ubo_layout` so the host knows where to
+      write each declared parameter and standard field.
 
-**Demo:** Apply a trivial single-pass slang shader (e.g. scanlines) to a
-video. Output looks correct. Frame-by-frame parity check against
-RetroArch.
-
----
-
-## Phase 5 — Multi-pass chain
-
-- [ ] Per-pass framebuffer allocation honoring `scale_type`/`scale`.
-- [ ] Pass alias map: pass N's output is bound as both `Source` for
-      pass N+1 and as the alias name (e.g. `accum1`) for any later pass
-      that declares it.
-- [ ] `Original` sampler always bound to the original input image.
-- [ ] `Pass<n>` (numeric) accessors for any pass referencing previous
-      pass outputs by index.
-
-**Demo:** A two-pass blur shader produces correct output on both axes.
+**Verified:** real libretro shader `misc/image-adjustment.slangp`
+(which `#include`s `../../include/colorspace-tools.h`) compiles
+through end-to-end and the resulting pipeline runs.
 
 ---
 
-## Phase 6 — `PassFeedback<n>` and `OriginalHistory<n>`
+## Phase 4 — Single slang shader applied to video *(done)*
+
+- [x] Pipeline binding contract matches slang convention:
+      UBO @ set=0,binding=0; Source sampler @ set=0,binding=2;
+      push_constant range covering `slang_push`; vertex inputs at
+      locations 0 (vec4 Position) and 1 (vec2 TexCoord).
+- [x] Vertex/index buffers (4-vert fullscreen quad, 6 indices, two
+      triangles) — slang vertex shaders consume these directly.
+- [x] UBO populated with identity MVP.
+- [x] Push constants populated with SourceSize, OriginalSize,
+      OutputSize, FrameCount each frame.
+- [x] When preset has 1 pass with a path → compile via
+      `slang_compile_file`, use its SPIR-V; otherwise fall back to a
+      built-in slang passthrough.
+
+**Verified:** `tests/fixtures/invert.slang` (full slang shader with
+both stages) inverts solid-red input to cyan; spatial gradient inverts
+pixel-perfect; built-in passthrough preserves red.
+
+---
+
+## Phase 5 — Multi-pass chain *(MVP done; alias / Pass<n> / Original deferred)*
+
+- [x] Per-pass `pass_state` holding its own framebuffer image, render
+      pass, descriptor set, pipeline, sampler.
+- [x] Per-pass framebuffer dimensions resolved from `scale_type[_x|_y]`
+      and `scale[_x|_y]` (source / viewport / absolute, per axis).
+- [x] Per-pass sampler honors `filter_linear` and `wrap_mode`.
+- [x] Source chaining: pass N's `Source` descriptor binds pass N-1's
+      output view (or the original input for pass 0). Render pass
+      finalLayout = SHADER_READ_ONLY so chaining is layout-correct.
+- [ ] **Phase 5b — alias bindings:** preset `alias<i> = name` declares
+      a sampler the next pass can bind by that name. Implement: build
+      alias→pass-index map at setup, extend descriptor sets to include
+      one extra sampler binding per resolved alias used by the
+      consuming pass.
+- [ ] **Phase 5c — `Pass<n>`:** numeric pass refs. Same mechanism as
+      aliases but keyed by index. Detect by SPIR-V reflection in
+      Phase 7.
+- [ ] **Phase 5d — `Original` / `OriginalSize`:** every pass should be
+      able to bind the *original* input image as a sampler named
+      `Original` and read `OriginalSize` from push constants. Currently
+      `OriginalSize` is set in push but no descriptor binding exists.
+
+**Verified:** 2-pass `double_invert.slangp` produces byte-perfect
+identity from a 16×16 RGB gradient (every pass writes through the
+chain correctly). 4-pass shaders without alias references would also
+work. Real libretro shader `image-adjustment.slangp` (single pass with
+`#include`) compiles and runs.
+
+---
+
+## Phase 6 — `PassFeedback<n>` and `OriginalHistory<n>` *(not started)*
 
 - [ ] Detect at compile time which passes have feedback consumers
-      (search SPIR-V reflection / GLSL source for `PassFeedback<n>`).
-- [ ] Allocate ring of 2 framebuffers per feedback-producing pass; flip
-      after each frame.
+      (search SPIR-V reflection — Phase 7 dep — for samplers named
+      `PassFeedback<n>` / `<alias>Feedback`).
+- [ ] Per feedback-producing pass: extend `pass_state` to a 2-deep ring
+      of `(out_img, out_view)`. Per frame, this frame's pass output goes
+      to slot[parity], next frame's consumer reads slot[parity ^ 1].
+      Maintain a `frame_parity` bit that flips at the end of each
+      `pipeline_run`.
+- [ ] For consumers: extra sampler binding per declared `PassFeedback<n>`
+      ref, descriptor written to point at slot[parity ^ 1] before each
+      frame.
 - [ ] Detect history depth needed for `OriginalHistory<n>`. Allocate
       ring of N+1 input snapshots; rotate.
-- [ ] Wire into descriptor sets at the start of each frame.
 
 **Demo:** `crt/newpixie-crt.slangp` runs end-to-end with a real
-PassFeedback1 accumulator. The compounding multi-frame trail matches
-RetroArch's output (within rounding error).
+multi-frame accumulator (ghosting trails decay over many frames, not
+just one). Frame-perfect parity vs RetroArch.
 
 ---
 
-## Phase 7 — Push constants and UBO completion
+## Phase 7 — Push constants and UBO completion *(not started — top priority)*
 
-- [ ] All standard slang push constant fields:
-      `MVP, SourceSize, OutputSize, OriginalSize, FrameCount,
-      FrameDirection, Rotation, etc.`
-- [ ] `#pragma parameter` declarations exposed via the filter's `params`
-      option (`-vf "slang=preset=...:params=curvature=2.0,vignette=1.0"`)
-      and bound into the right push constant slot per pass.
+- [ ] **SPIR-V reflection.** Parse the SPIR-V binary (manually — search
+      for `OpDecorate <id> Offset N` on push-constant block members)
+      to discover, per shader stage:
+        - The push-constant block size + the offset of every member.
+        - The UBO block size + member offsets.
+        - The actual binding numbers used by every sampler.
+      Store on `slang_module.push_fields[]` / `ubo_fields[]` /
+      `samplers[]`. (Alternatively vendor SPIRV-Reflect, ~3K LOC, MIT.)
+- [ ] Standard fields populated by the host at their *reflected*
+      offsets: `MVP, SourceSize, OriginalSize, OutputSize, FrameCount,
+      FrameDirection, Rotation, FinalViewportSize, OriginalHistorySize<n>,
+      PassOutputSize<n>, PassFeedbackSize<n>, <alias>Size`.
+- [ ] `#pragma parameter` declarations: defaults applied at startup;
+      runtime overrides via `--params 'name=value,...'` get bound into
+      the right push-constant offset per pass.
 
-**Demo:** All knobs of `newpixie-crt` are runtime-tunable from the CLI.
+**Demo:** all knobs of `newpixie-crt` runtime-tunable. `image-adjustment`
+produces correct gamma/saturation/contrast output instead of the all-zero
+debug output we get today.
+
+**Why this is currently the bottleneck:** without offsets, the host
+guesses the layout and writes through one struct shape; the shader
+declares its own. Mismatched offsets mean shader-side reads return
+zero / garbage, which manifests as "shader runs but output looks wrong"
+on every shader whose Push block isn't `vec4 SourceSize, OriginalSize,
+OutputSize; uint FrameCount`.
 
 ---
 
