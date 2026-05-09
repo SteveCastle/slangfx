@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+# Source / docs / build are LF.
+*.c    text eol=lf
+*.h    text eol=lf
+*.md   text eol=lf
+*.build text eol=lf
+*.options text eol=lf
+*.slangp text eol=lf
+*.slang text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+
+# Image / binary fixtures.
+*.png  binary
+*.jpg  binary
+*.spv  binary
