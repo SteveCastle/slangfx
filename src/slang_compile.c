@@ -34,6 +34,8 @@
 
 #include <shaderc/shaderc.h>
 
+#include "spv_reflect.h"
+
 static char *xstrdup(const char *s)
 {
     if (!s) return NULL;
@@ -494,7 +496,12 @@ static struct slang_module *compile_internal(const char *src,
     shaderc_compile_options_set_target_env(options,
         shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
     shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_5);
-    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
+    /* IMPORTANT: keep debug info so OpName / OpMemberName survive into the
+     * emitted SPIR-V. Reflection (Phase 7) needs the names to resolve the
+     * shader's #pragma parameter declarations to push-constant offsets.
+     * Without names, optimization_level_performance silently strips them. */
+    shaderc_compile_options_set_generate_debug_info(options);
+    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_zero);
 
     /* #include resolution. base_dir falls back through (a) explicit
      * include_dir param, (b) the slang file's parent dir, (c) "."" */
@@ -527,6 +534,90 @@ static struct slang_module *compile_internal(const char *src,
         slang_module_free(mod);
         return NULL;
     }
+
+    /* SPIR-V reflection (Phase 7). Reflect on the fragment stage — the slang
+     * shader contract has the same Push/UBO declared in both stages (they
+     * share the GLSL header before #pragma stage), so either reflects to the
+     * same answer; the fragment stage is reliably present.
+     *
+     * Failure to reflect is non-fatal for the binary (built-in shaders that
+     * don't declare a Push block produce empty results, which is correct);
+     * we just skip populating push_fields. */
+    {
+        struct spv_reflect_result rr;
+        char *rerr = NULL;
+        int reflect_rc = spv_reflect(mod->frag_spv, mod->frag_spv_words, &rr, &rerr);
+        const char *vfslang_dbg = getenv("VFSLANG_DEBUG_REFLECT");
+        if (vfslang_dbg) {
+            fprintf(stderr, "[reflect] rc=%d err=%s has_push=%d push.size=%u members=%zu samplers=%zu\n",
+                    reflect_rc, rerr ? rerr : "-",
+                    rr.has_push, rr.push.size, rr.push.num_members, rr.num_samplers);
+            for (size_t i = 0; i < rr.push.num_members; ++i)
+                fprintf(stderr, "  push[%zu]: %s @ offset=%u\n",
+                        i, rr.push.members[i].name ? rr.push.members[i].name : "(noname)",
+                        rr.push.members[i].offset);
+            for (size_t i = 0; i < rr.num_samplers; ++i)
+                fprintf(stderr, "  sampler[%zu]: %s set=%u binding=%u\n",
+                        i, rr.samplers[i].name ? rr.samplers[i].name : "(noname)",
+                        rr.samplers[i].descriptor_set, rr.samplers[i].binding);
+        }
+        if (reflect_rc == 0) {
+            if (rr.has_push && rr.push.num_members > 0) {
+                mod->push_total_size  = rr.push.size;
+                mod->push_fields      = (struct slang_push_field *)
+                    calloc(rr.push.num_members, sizeof(*mod->push_fields));
+                if (mod->push_fields) {
+                    mod->num_push_fields = rr.push.num_members;
+                    for (size_t i = 0; i < rr.push.num_members; ++i) {
+                        mod->push_fields[i].name   = xstrdup(rr.push.members[i].name);
+                        mod->push_fields[i].offset = rr.push.members[i].offset;
+                        mod->push_fields[i].size   = 4;  /* Phase-7 simple */
+                    }
+                }
+            }
+            if (rr.has_ubo && rr.ubo.num_members > 0) {
+                mod->ubo_total_size = rr.ubo.size;
+                mod->ubo_fields     = (struct slang_push_field *)
+                    calloc(rr.ubo.num_members, sizeof(*mod->ubo_fields));
+                if (mod->ubo_fields) {
+                    mod->num_ubo_fields = rr.ubo.num_members;
+                    for (size_t i = 0; i < rr.ubo.num_members; ++i) {
+                        mod->ubo_fields[i].name   = xstrdup(rr.ubo.members[i].name);
+                        mod->ubo_fields[i].offset = rr.ubo.members[i].offset;
+                        mod->ubo_fields[i].size   = 4;
+                    }
+                }
+            }
+            if (rr.num_samplers > 0) {
+                mod->samplers = (struct slang_sampler *)
+                    calloc(rr.num_samplers, sizeof(*mod->samplers));
+                if (mod->samplers) {
+                    mod->num_samplers = rr.num_samplers;
+                    for (size_t i = 0; i < rr.num_samplers; ++i) {
+                        mod->samplers[i].name           = xstrdup(rr.samplers[i].name);
+                        mod->samplers[i].descriptor_set = rr.samplers[i].descriptor_set;
+                        mod->samplers[i].binding        = rr.samplers[i].binding;
+                    }
+                }
+            }
+            spv_reflect_free(&rr);
+
+            /* Resolve each #pragma parameter's name to its push offset.
+             * Defaults are written at runtime by the pipeline. */
+            for (size_t i = 0; i < mod->num_params; ++i) {
+                mod->params[i].push_offset = 0;  /* sentinel = unresolved */
+                for (size_t j = 0; j < mod->num_push_fields; ++j) {
+                    if (mod->push_fields[j].name &&
+                        strcmp(mod->push_fields[j].name, mod->params[i].name) == 0) {
+                        mod->params[i].push_offset = mod->push_fields[j].offset;
+                        break;
+                    }
+                }
+            }
+        }
+        free(rerr);
+    }
+
     return mod;
 }
 

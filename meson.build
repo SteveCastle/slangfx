@@ -80,6 +80,7 @@ vfslang_sources = files(
   'src/slangp.c',
   'src/slang_compile.c',
   'src/slang_pipeline.c',
+  'src/spv_reflect.c',
 )
 
 vfslang_inc = include_directories('src')

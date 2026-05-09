@@ -158,34 +158,45 @@ just one). Frame-perfect parity vs RetroArch.
 
 ---
 
-## Phase 7 — Push constants and UBO completion *(not started — top priority)*
+## Phase 7 — Push constants + UBO completion *(done)*
 
-- [ ] **SPIR-V reflection.** Parse the SPIR-V binary (manually — search
-      for `OpDecorate <id> Offset N` on push-constant block members)
-      to discover, per shader stage:
-        - The push-constant block size + the offset of every member.
-        - The UBO block size + member offsets.
-        - The actual binding numbers used by every sampler.
-      Store on `slang_module.push_fields[]` / `ubo_fields[]` /
-      `samplers[]`. (Alternatively vendor SPIRV-Reflect, ~3K LOC, MIT.)
-- [ ] Standard fields populated by the host at their *reflected*
-      offsets: `MVP, SourceSize, OriginalSize, OutputSize, FrameCount,
-      FrameDirection, Rotation, FinalViewportSize, OriginalHistorySize<n>,
-      PassOutputSize<n>, PassFeedbackSize<n>, <alias>Size`.
-- [ ] `#pragma parameter` declarations: defaults applied at startup;
-      runtime overrides via `--params 'name=value,...'` get bound into
-      the right push-constant offset per pass.
+- [x] **SPIR-V reflection** in `src/spv_reflect.{h,c}`: walks the
+      binary directly (no external dep), tracks `OpName /
+      OpMemberName / OpDecorate / OpMemberDecorate / OpTypePointer /
+      OpTypeStruct / OpVariable`, emits push block (size + member name +
+      offset), UBO block, and sampler bindings. ~430 LOC.
+- [x] `slang_compile.c` calls reflection on the fragment SPIR-V and
+      populates `slang_module.push_fields[]`, `ubo_fields[]`,
+      `samplers[]`. Each `#pragma parameter` is matched by name to a
+      push field; `params[i].push_offset` is set accordingly.
+- [x] **shaderc preserves debug info.** Crucial subtlety: with
+      `optimization_level_performance` shaderc strips OpName /
+      OpMemberName, leaving reflection unable to match parameters by
+      name. Now using `optimization_level_zero` plus
+      `set_generate_debug_info` so names survive into emitted SPIR-V.
+      Optimization can be moved to a later post-pass over the SPIR-V if
+      perf becomes a concern.
+- [x] Pipeline rebuilt to write the push-constant blob honoring the
+      shader's reflected layout. Standard fields (`SourceSize`,
+      `OriginalSize`, `OutputSize`, `FinalViewportSize`, `FrameCount`,
+      `FrameDirection`, `Rotation`) are written if-and-where the shader
+      declared them; `#pragma parameter` defaults are written at their
+      resolved offsets.
+- [x] `VFSLANG_DEBUG_REFLECT=1` env var dumps the per-shader reflection
+      result to stderr for debugging.
+- [ ] **Deferred to Phase 7b:** runtime overrides via
+      `--params 'name=value,...'`. The plumbing is in place
+      (`vf_slang.c` already has `--params`); just needs to parse the
+      string + write into `push_fields[]` lookup.
 
-**Demo:** all knobs of `newpixie-crt` runtime-tunable. `image-adjustment`
-produces correct gamma/saturation/contrast output instead of the all-zero
-debug output we get today.
-
-**Why this is currently the bottleneck:** without offsets, the host
-guesses the layout and writes through one struct shape; the shader
-declares its own. Mismatched offsets mean shader-side reads return
-zero / garbage, which manifests as "shader runs but output looks wrong"
-on every shader whose Push block isn't `vec4 SourceSize, OriginalSize,
-OutputSize; uint FrameCount`.
+**Verified:**
+- Synthetic test: `tests/fixtures/brightness.slang` (parameter
+  `brightness` default 0.5) — red 255 → 127 output, exactly 255 × 0.5
+  rounded down. Without Phase 7 this was 0.
+- Real libretro shader `image-adjustment.slangp` — all 24 push members
+  reflected (SourceSize, FrameCount, plus 22 `ia_*` parameters).
+  Mid-gray input is preserved through the default identity transform,
+  3008/3072 output RGB bytes non-zero (vs 0/3072 in Phase 5).
 
 ---
 

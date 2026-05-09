@@ -74,6 +74,10 @@ full pipeline (`.slangp` → `.slang` → SPIR-V → Vulkan). Done so far:
   + vertex buffers + slang sampler binding convention).
 - **Phase 5 (MVP)** — multi-pass chain: per-pass framebuffer/pipeline,
   `Source` chained pass-to-pass, per-pass scale rules + filter/wrap.
+- **Phase 7** — SPIR-V reflection: push-constant layout, UBO layout,
+  and sampler bindings recovered from the SPIR-V directly. The host
+  writes standard fields and `#pragma parameter` defaults at the
+  shader's declared offsets — no more guessing.
 
 Verified:
 - 4×4 red input → cyan via `tests/fixtures/invert.slang` (real slang
@@ -90,11 +94,9 @@ What's left:
   (incremental on top of the existing chain).
 - **Phase 6** — `PassFeedback<n>` ring buffers (multi-frame compounding
   accumulator). 2-deep ring per producer; flip per frame.
-- **Phase 7** *(top priority)* — SPIR-V reflection so push-constant
-  offsets, UBO offsets, and sampler bindings are read from the shader
-  rather than guessed by host convention. Without this, parameters
-  read zero (which is why `image-adjustment` output looks wrong even
-  though the shader runs).
+- **Phase 7b** — runtime parameter overrides via the existing
+  `--params 'name=value,...'` flag. Reflection now provides the
+  offsets; just need to parse the string and write the values.
 - **Phase 8** — external textures (PNG via vendored stb_image).
 - **Phase 9** — YUV input/output + zero-copy `AV_PIX_FMT_VULKAN` path.
 - **Phase 10** — corpus parity vs RetroArch + libavfilter patch

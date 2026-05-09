@@ -793,6 +793,11 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
 
     /* Iterate passes. */
     uint32_t prev_w = p->input_w, prev_h = p->input_h;
+    /* Reflected push-constant blob, sized per pass to match the shader's
+     * declared layout (Phase 7). 256 bytes is the Vulkan-required minimum
+     * push range; well beyond what slang shaders use. */
+    uint8_t  push_blob[256];
+    uint32_t push_size_used;
     for (size_t i = 0; i < p->num_passes; ++i) {
         struct pass_state *ps = &p->passes[i];
 
@@ -803,6 +808,74 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         pc.output_size[0] = (float)ps->out_w; pc.output_size[1] = (float)ps->out_h;
         pc.output_size[2] = 1.0f / (float)ps->out_w;
         pc.output_size[3] = 1.0f / (float)ps->out_h;
+
+        /* Build a push-constant blob honoring this shader's reflected layout.
+         * For each declared push field we look up its name and write the
+         * matching standard-field bytes at the right offset. Fields the
+         * shader didn't declare are simply not written. After the standard
+         * fields, every #pragma parameter default is written at its
+         * resolved offset. */
+        memset(push_blob, 0, sizeof(push_blob));
+        push_size_used = 0;
+        if (ps->mod && ps->mod->num_push_fields > 0) {
+            for (size_t f = 0; f < ps->mod->num_push_fields; ++f) {
+                const struct slang_push_field *pf = &ps->mod->push_fields[f];
+                if (!pf->name || pf->offset >= sizeof(push_blob)) continue;
+                if (pf->offset > push_size_used) push_size_used = pf->offset;
+                if (!strcmp(pf->name, "SourceSize")) {
+                    if (pf->offset + 16 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, pc.source_size, 16);
+                    push_size_used = pf->offset + 16;
+                } else if (!strcmp(pf->name, "OriginalSize")) {
+                    if (pf->offset + 16 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, pc.original_size, 16);
+                    push_size_used = pf->offset + 16;
+                } else if (!strcmp(pf->name, "OutputSize")) {
+                    if (pf->offset + 16 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, pc.output_size, 16);
+                    push_size_used = pf->offset + 16;
+                } else if (!strcmp(pf->name, "FinalViewportSize")) {
+                    if (pf->offset + 16 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, pc.output_size, 16);
+                    push_size_used = pf->offset + 16;
+                } else if (!strcmp(pf->name, "FrameCount")) {
+                    if (pf->offset + 4 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, &pc.frame_count, 4);
+                    push_size_used = pf->offset + 4;
+                } else if (!strcmp(pf->name, "FrameDirection")) {
+                    int32_t dir = 1;
+                    if (pf->offset + 4 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, &dir, 4);
+                    push_size_used = pf->offset + 4;
+                } else if (!strcmp(pf->name, "Rotation")) {
+                    uint32_t rot = 0;
+                    if (pf->offset + 4 <= sizeof(push_blob))
+                        memcpy(push_blob + pf->offset, &rot, 4);
+                    push_size_used = pf->offset + 4;
+                }
+            }
+            /* Apply each #pragma parameter default at its resolved offset. */
+            for (size_t f = 0; f < ps->mod->num_params; ++f) {
+                const struct slang_param *pp = &ps->mod->params[f];
+                if (pp->push_offset == 0 && pp->name) {
+                    /* unresolved (no matching push field name) — skip */
+                    continue;
+                }
+                if (pp->push_offset + 4 > sizeof(push_blob)) continue;
+                memcpy(push_blob + pp->push_offset, &pp->default_value, 4);
+                if (pp->push_offset + 4 > push_size_used)
+                    push_size_used = pp->push_offset + 4;
+            }
+        } else {
+            /* No reflection (e.g. built-in passthrough): use the legacy
+             * fixed slang_push struct exactly. */
+            memcpy(push_blob, &pc, sizeof(pc));
+            push_size_used = sizeof(pc);
+        }
+        /* Round up to 4 (Vulkan requires 4-byte aligned push range). */
+        push_size_used = (push_size_used + 3) & ~3u;
+        if (push_size_used == 0) push_size_used = 4;
+        if (push_size_used > sizeof(push_blob)) push_size_used = sizeof(push_blob);
 
         VkClearValue clear = { .color = { .float32 = { 0, 0, 0, 1 } } };
         VkRenderPassBeginInfo rpbi = {
@@ -817,10 +890,10 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
                                 ps->pipe_layout, 0, 1, &ps->dset, 0, NULL);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(p->cmd, 0, 1, &p->vbuf, &off);
-        vkCmdBindIndexBuffer(p->cmd, ps->framebuffer ? p->ibuf : p->ibuf, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdBindIndexBuffer(p->cmd, p->ibuf, 0, VK_INDEX_TYPE_UINT16);
         vkCmdPushConstants(p->cmd, ps->pipe_layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(pc), &pc);
+                           0, push_size_used, push_blob);
         vkCmdDrawIndexed(p->cmd, 6, 1, 0, 0, 0);
         vkCmdEndRenderPass(p->cmd);
 
