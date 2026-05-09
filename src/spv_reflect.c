@@ -1,5 +1,5 @@
 /*
- * vf-slang — minimal SPIR-V reflector.
+ * slangfx — minimal SPIR-V reflector.
  *
  * Implements just enough of the SPIR-V binary format to recover:
  *   - push-constant block layout (member names + byte offsets + total size)

@@ -1,5 +1,5 @@
 /*
- * vf-slang — slang shader → SPIR-V compilation.
+ * slangfx — slang shader → SPIR-V compilation.
  *
  * Each .slang file is a single source containing both vertex and fragment
  * stages, separated by `#pragma stage <name>`. We split it, run each half

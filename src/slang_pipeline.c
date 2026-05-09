@@ -1,5 +1,5 @@
 /*
- * vf-slang — Vulkan offscreen render pipeline.
+ * slangfx — Vulkan offscreen render pipeline.
  *
  * Phase 1: VkInstance/VkDevice + offscreen render-to-texture (single pass).
  * Phase 4: pipeline driven by a real slang shader from a .slangp preset.
@@ -238,8 +238,8 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
 {
     VkApplicationInfo ai = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "vfslang", .applicationVersion = 1,
-        .pEngineName = "vfslang", .engineVersion = 1,
+        .pApplicationName = "slangfx", .applicationVersion = 1,
+        .pEngineName = "slangfx", .engineVersion = 1,
         .apiVersion = VK_API_VERSION_1_3,
     };
     VkInstanceCreateInfo ici = {
@@ -549,7 +549,7 @@ static int resolve_sampler_name(struct slang_pipeline *p,
 
 /* Resolve a pass's output dimensions from its slangp scale rules.
  * `prev_w/h` is the previous pass's output (or the input frame for pass 0).
- * `final_w/h` is the final viewport (downstream output of vfslang).
+ * `final_w/h` is the final viewport (downstream output of slangfx).
  *
  * For per-axis rules we honor scale_type_x/scale_type_y separately. */
 static void resolve_pass_dims(const struct slangp_pass *ps,
@@ -981,7 +981,7 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
              * produce garbage on stdout. */
             VkFormat pfmt = (i == n_passes - 1) ? VK_FORMAT_R8G8B8A8_UNORM
                                                  : resolve_pass_format(ppass);
-            if (getenv("VFSLANG_DEBUG_FORMAT")) {
+            if (getenv("SLANGFX_DEBUG_FORMAT")) {
                 fprintf(stderr,
                         "[pass %zu] %ux%u  format=%d  float_fb=%d  srgb_fb=%d  fbo_fmt=%d\n",
                         i, pw, ph, (int)pfmt,

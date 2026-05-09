@@ -1,5 +1,5 @@
 /*
- * vf-slang — slang preset (.slangp) parser.
+ * slangfx — slang preset (.slangp) parser.
  *
  * Hand-written INI-style parser. Sufficient for the libretro slang-shaders
  * corpus; no external INI dependency.

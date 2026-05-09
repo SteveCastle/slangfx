@@ -1,14 +1,18 @@
+---
+title: Architecture
+---
+
 # Architecture
 
 ## IO model
 
-`vfslang` is a standalone process that reads raw RGBA8 frames from stdin
+`slangfx` is a standalone process that reads raw RGBA8 frames from stdin
 and writes processed frames to stdout. ffmpeg orchestrates everything
-around it via pipes: decode → rawvideo → vfslang → rawvideo → encode.
+around it via pipes: decode → rawvideo → slangfx → rawvideo → encode.
 
 ```
 ┌─────────────┐  RGBA pipe  ┌─────────┐  RGBA pipe  ┌─────────────┐
-│   ffmpeg    │ ──────────► │ vfslang │ ──────────► │   ffmpeg    │
+│   ffmpeg    │ ──────────► │ slangfx │ ──────────► │   ffmpeg    │
 │  (decode)   │             │ (GPU)   │             │  (encode)   │
 └─────────────┘             └─────────┘             └─────────────┘
        ▲                                                   │
@@ -22,7 +26,7 @@ on ffmpeg as a runtime executable that anyone already has. The libavfilter
 patch for upstream submission becomes a Phase-10 packaging task, not a
 build dependency.
 
-`wrappers/vfslang.py` automates the orchestration: probes input dims,
+`wrappers/slangfx.py` automates the orchestration: probes input dims,
 spawns the three processes, passes audio through unchanged from the source
 container.
 
@@ -30,7 +34,7 @@ container.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  src/vf_slang.c            stdin/stdout frame loop + arg parsing │
+│  src/main.c                stdin/stdout frame loop + arg parsing │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
                   ┌──────────────┴──────────────┐
@@ -100,7 +104,7 @@ Per-frame loop:
 5. Advance feedback rings (this pass's current output becomes next
    frame's `PassFeedback<n>`); rotate `OriginalHistory`.
 
-### `vf_slang.c` — frame loop
+### `main.c` — frame loop
 
 Parses CLI args (`--preset`, `--width`, `--height`, optional `--params` /
 `--frame-history`), opens the preset, builds the pipeline, then in a hot

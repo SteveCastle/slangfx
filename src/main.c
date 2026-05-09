@@ -1,5 +1,5 @@
 /*
- * vfslang — standalone raw-frame filter binary.
+ * slangfx — standalone raw-frame filter binary.
  *
  * Reads RGBA8 frames from stdin, applies a slang shader chain, writes
  * processed RGBA8 frames to stdout. Frame dimensions are passed via
@@ -15,11 +15,11 @@
  *
  * Usage (raw):
  *   ffmpeg -i in.mp4 -f rawvideo -pix_fmt rgba - \
- *     | vfslang --preset crt/newpixie.slangp --width W --height H \
+ *     | slangfx --preset crt/newpixie.slangp --width W --height H \
  *     | ffmpeg -f rawvideo -pix_fmt rgba -s WxH -framerate 30 -i - \
  *             -i in.mp4 -map 0:v -map 1:a -c:v libx264 -c:a copy out.mp4
  *
- * Usage (high-level): see wrappers/vfslang.py.
+ * Usage (high-level): see wrappers/slangfx.py.
  */
 
 #include <stdio.h>
@@ -62,7 +62,7 @@ static int parse_args(int argc, char **argv, struct args *a)
         else if (!strcmp(opt, "--frame-history") && val) { a->frame_history = atoi(val); ++i; }
         else if (!strcmp(opt, "-h") || !strcmp(opt, "--help")) {
             fprintf(stderr,
-                "vfslang - apply a slang shader chain to raw RGBA video frames.\n"
+                "slangfx - apply a slang shader chain to raw RGBA video frames.\n"
                 "Reads RGBA frames from stdin, writes RGBA frames to stdout.\n"
                 "\n"
                 "Required:\n"
@@ -75,18 +75,18 @@ static int parse_args(int argc, char **argv, struct args *a)
                 "\n"
                 "Example:\n"
                 "  ffmpeg -i in.mp4 -f rawvideo -pix_fmt rgba - \\\n"
-                "    | vfslang --preset crt/newpixie.slangp --width 1920 --height 1080 \\\n"
+                "    | slangfx --preset crt/newpixie.slangp --width 1920 --height 1080 \\\n"
                 "    | ffmpeg -f rawvideo -pix_fmt rgba -s 1920x1080 -i - out.mp4\n");
             return 1;
         }
         else {
-            fprintf(stderr, "vfslang: unknown option '%s' (try --help)\n", opt);
+            fprintf(stderr, "slangfx: unknown option '%s' (try --help)\n", opt);
             return -1;
         }
     }
 
     if (!a->preset_path || a->width <= 0 || a->height <= 0) {
-        fprintf(stderr, "vfslang: --preset, --width, and --height are required\n");
+        fprintf(stderr, "slangfx: --preset, --width, and --height are required\n");
         return -1;
     }
     return 0;
@@ -108,7 +108,7 @@ int main(int argc, char **argv)
     char *err = NULL;
     struct slangp_preset *preset = slangp_parse_file(args.preset_path, &err);
     if (!preset) {
-        fprintf(stderr, "vfslang: failed to load preset '%s': %s\n",
+        fprintf(stderr, "slangfx: failed to load preset '%s': %s\n",
                 args.preset_path, err ? err : "(unknown)");
         free(err);
         return 3;
@@ -117,7 +117,7 @@ int main(int argc, char **argv)
     struct slang_pipeline *pipeline = slang_pipeline_create(
         preset, args.width, args.height, args.width, args.height, &err);
     if (!pipeline) {
-        fprintf(stderr, "vfslang: pipeline init failed: %s\n",
+        fprintf(stderr, "slangfx: pipeline init failed: %s\n",
                 err ? err : "(unknown)");
         free(err);
         slangp_free(preset);
@@ -128,7 +128,7 @@ int main(int argc, char **argv)
     unsigned char *frame_in  = malloc(frame_bytes);
     unsigned char *frame_out = malloc(frame_bytes);
     if (!frame_in || !frame_out) {
-        fprintf(stderr, "vfslang: out of memory\n");
+        fprintf(stderr, "slangfx: out of memory\n");
         free(frame_in); free(frame_out);
         slang_pipeline_destroy(pipeline);
         slangp_free(preset);
@@ -140,21 +140,21 @@ int main(int argc, char **argv)
         size_t got = fread(frame_in, 1, frame_bytes, stdin);
         if (got == 0) break;                             /* clean EOF */
         if (got != frame_bytes) {
-            fprintf(stderr, "vfslang: short read at frame %llu (%zu / %zu bytes)\n",
+            fprintf(stderr, "slangfx: short read at frame %llu (%zu / %zu bytes)\n",
                     frames, got, frame_bytes);
             break;
         }
 
         rc = slang_pipeline_run(pipeline, frame_in, frame_out);
         if (rc != 0) {
-            fprintf(stderr, "vfslang: pipeline run failed at frame %llu (rc=%d)\n",
+            fprintf(stderr, "slangfx: pipeline run failed at frame %llu (rc=%d)\n",
                     frames, rc);
             break;
         }
 
         size_t wrote = fwrite(frame_out, 1, frame_bytes, stdout);
         if (wrote != frame_bytes) {
-            fprintf(stderr, "vfslang: short write at frame %llu (%zu / %zu bytes)\n",
+            fprintf(stderr, "slangfx: short write at frame %llu (%zu / %zu bytes)\n",
                     frames, wrote, frame_bytes);
             break;
         }
@@ -168,6 +168,6 @@ int main(int argc, char **argv)
     slang_pipeline_destroy(pipeline);
     slangp_free(preset);
 
-    fprintf(stderr, "vfslang: processed %llu frames\n", frames);
+    fprintf(stderr, "slangfx: processed %llu frames\n", frames);
     return 0;
 }

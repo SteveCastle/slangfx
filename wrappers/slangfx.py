@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-vfslang.py — convenience wrapper around the vfslang binary.
+slangfx.py — convenience wrapper around the slangfx binary.
 
 Pipes:
-    ffmpeg (decode → rawvideo) → vfslang (apply slang shaders) → ffmpeg (encode)
+    ffmpeg (decode → rawvideo) → slangfx (apply slang shaders) → ffmpeg (encode)
 
 This script handles dimension probing, pixel-format conversion, audio
 passthrough, and writes a normal output container. Audio is taken from the
 input file unchanged.
 
 Usage:
-    python vfslang.py -i in.mp4 --preset crt/newpixie.slangp -o out.mp4
+    python slangfx.py -i in.mp4 --preset crt/newpixie.slangp -o out.mp4
 
 If you'd rather run the pipes manually:
     ffmpeg -i in.mp4 -f rawvideo -pix_fmt rgba - \
-      | vfslang --preset crt/newpixie.slangp --width W --height H \
+      | slangfx --preset crt/newpixie.slangp --width W --height H \
       | ffmpeg -f rawvideo -pix_fmt rgba -s WxH -framerate FR -i - \
               -i in.mp4 -map 0:v -map 1:a -c:v libx264 -c:a copy out.mp4
 """
@@ -52,8 +52,8 @@ def main() -> int:
                     help="Path to .slangp preset file.")
     ap.add_argument("--params", default=None,
                     help="Comma-separated #pragma parameter overrides (k=v,k=v).")
-    ap.add_argument("--vfslang", default="vfslang",
-                    help="Path to the vfslang binary. Defaults to PATH lookup.")
+    ap.add_argument("--slangfx", default="slangfx",
+                    help="Path to the slangfx binary. Defaults to PATH lookup.")
     ap.add_argument("--ffmpeg", default="ffmpeg",
                     help="Path to ffmpeg binary. Defaults to PATH lookup.")
     ap.add_argument("--vcodec", default="libx264",
@@ -65,8 +65,8 @@ def main() -> int:
 
     if shutil.which(args.ffmpeg) is None:
         sys.exit(f"ffmpeg not found at '{args.ffmpeg}'")
-    if shutil.which(args.vfslang) is None and not Path(args.vfslang).exists():
-        sys.exit(f"vfslang not found at '{args.vfslang}' (build with `meson compile -C build`)")
+    if shutil.which(args.slangfx) is None and not Path(args.slangfx).exists():
+        sys.exit(f"slangfx not found at '{args.slangfx}' (build with `meson compile -C build`)")
 
     w, h, fr = probe(args.input)
     print(f"input: {w}x{h} @ {fr}", file=sys.stderr)
@@ -77,7 +77,7 @@ def main() -> int:
         "-f", "rawvideo", "-pix_fmt", "rgba", "-",
     ]
 
-    process = [args.vfslang, "--preset", str(args.preset),
+    process = [args.slangfx, "--preset", str(args.preset),
                "--width", str(w), "--height", str(h)]
     if args.params:
         process += ["--params", args.params]

@@ -1,8 +1,15 @@
+---
+title: Roadmap
+---
+
 # Roadmap
 
-Phased plan toward a `vf_slang` filter that can apply `crt/newpixie-crt.slangp`
-(plus most of `libretro/slang-shaders`) with output indistinguishable from
-RetroArch's vulkan driver.
+Phased plan toward a slang shader runtime that can apply
+`crt/newpixie-crt.slangp` (plus most of `libretro/slang-shaders`) with
+output indistinguishable from RetroArch's vulkan driver. Phases 0–7 are
+done; the standalone `slangfx` binary is what you build today. Phases 8–10
+are deferred work — see [Limitations]({{ '/limitations.html' | relative_url
+}}) for what that means in practice.
 
 The phases are sized for measurable, mergeable chunks. Each ends with a
 demo and a checked-in test fixture.
@@ -15,15 +22,12 @@ demo and a checked-in test fixture.
 - [x] `meson.build` (Vulkan + shaderc gated behind `-Denable_gpu=true`).
 - [x] Source stubs with documented interfaces.
 - [x] `docs/architecture.md`, `docs/roadmap.md`, `docs/slang_format.md`
-- [x] `wrappers/vfslang.py` for ffmpeg ↔ vfslang ↔ ffmpeg orchestration.
+- [x] `wrappers/slangfx.py` for ffmpeg ↔ slangfx ↔ ffmpeg orchestration.
 
 **Demo:** `meson setup build && meson compile -C build` produces a working
-`vfslang` binary. It reads RGBA frames from stdin and writes them to
-stdout (currently identity copy, the work happens in subsequent phases).
-`vfslang --help` prints usage. `wrappers/vfslang.py -i in.mp4 --preset
-foo.slangp -o out.mp4` runs end-to-end (with the preset parser stubbed
-so it'll bail with a friendly "not yet implemented (Phase 2)" message —
-proving the whole pipe pipeline works).
+`slangfx` binary. It reads RGBA frames from stdin and writes them to
+stdout. `slangfx --help` prints usage. `wrappers/slangfx.py -i in.mp4
+--preset foo.slangp -o out.mp4` runs end-to-end.
 
 ---
 
@@ -189,11 +193,11 @@ represent at all.
       `FrameDirection`, `Rotation`) are written if-and-where the shader
       declared them; `#pragma parameter` defaults are written at their
       resolved offsets.
-- [x] `VFSLANG_DEBUG_REFLECT=1` env var dumps the per-shader reflection
+- [x] `SLANGFX_DEBUG_REFLECT=1` env var dumps the per-shader reflection
       result to stderr for debugging.
 - [ ] **Deferred to Phase 7b:** runtime overrides via
       `--params 'name=value,...'`. The plumbing is in place
-      (`vf_slang.c` already has `--params`); just needs to parse the
+      (`main.c` already has `--params`); just needs to parse the
       string + write into `push_fields[]` lookup.
 
 **Verified:**
@@ -240,7 +244,7 @@ intermediate format conversion stage.
       Build a perceptual-diff dashboard.
 - [ ] Resolve any remaining behavioral divergences from the reference.
 - [ ] Wrap the same `slang_pipeline` core into a `libavfilter` filter
-      (`vf_slang.c` re-using all of `slangp.c`, `slang_compile.c`,
+      (a new `vf_slang.c` re-using all of `slangp.c`, `slang_compile.c`,
       `slang_pipeline.c`). The pipeline code stays the same; only the
       frame-source/sink shell changes from stdin/stdout to
       `AVFilterContext`. Submit upstream patchset; precedent:
@@ -248,8 +252,8 @@ intermediate format conversion stage.
 
 **Demo:** `vf_slang` ships in ffmpeg HEAD as a default-built filter on
 systems where Vulkan + shaderc are detected by `configure`. The
-standalone binary remains as a pip-installable / homebrew-able tool for
-people on older ffmpeg versions.
+`slangfx` standalone binary remains as a pip-installable /
+homebrew-able tool for people on older ffmpeg versions.
 
 ---
 

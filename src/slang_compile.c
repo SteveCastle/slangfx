@@ -1,5 +1,5 @@
 /*
- * vf-slang — slang shader → SPIR-V compilation via shaderc.
+ * slangfx — slang shader → SPIR-V compilation via shaderc.
  *
  * The libretro slang format is GLSL with a few preprocessor extensions:
  *   #pragma stage vertex      / #pragma stage fragment
@@ -678,8 +678,8 @@ static struct slang_module *compile_internal(const char *src,
         struct spv_reflect_result rr;
         char *rerr = NULL;
         int reflect_rc = spv_reflect(mod->frag_spv, mod->frag_spv_words, &rr, &rerr);
-        const char *vfslang_dbg = getenv("VFSLANG_DEBUG_REFLECT");
-        if (vfslang_dbg) {
+        const char *slangfx_dbg = getenv("SLANGFX_DEBUG_REFLECT");
+        if (slangfx_dbg) {
             fprintf(stderr, "[reflect] rc=%d err=%s has_push=%d push.size=%u members=%zu samplers=%zu\n",
                     reflect_rc, rerr ? rerr : "-",
                     rr.has_push, rr.push.size, rr.push.num_members, rr.num_samplers);

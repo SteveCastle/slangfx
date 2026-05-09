@@ -1,0 +1,36 @@
+# Jekyll config for the slangfx docs site.
+# GitHub Pages serves anything under docs/ on the main branch when
+# "Settings → Pages → Branch" is set to "main /docs".
+
+title: slangfx
+description: >-
+  Apply libretro-format slang shaders (CRT, NTSC/VHS, scanlines, scalers)
+  to any video. A standalone Vulkan-based binary that pipes raw frames
+  with ffmpeg.
+url: ""
+
+# Cayman is GitHub Pages' built-in project theme — no extra deps needed.
+theme: jekyll-theme-cayman
+
+# show_downloads enables the "View on GitHub" / source-zip / .tar.gz buttons
+# in Cayman's header. Keep it on once the repo is public.
+show_downloads: false
+
+# Markdown rendering
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  input: GFM
+  hard_wrap: false
+
+# Don't publish drafts, internal-only files, the meson build outputs, etc.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

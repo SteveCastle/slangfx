@@ -1,5 +1,5 @@
 /*
- * vf-slang — slang shader preset (.slangp) parser.
+ * slangfx — slang shader preset (.slangp) parser.
  *
  * Parses libretro-format INI-style preset files into a struct describing the
  * full multi-pass chain: shader paths, scale rules, sampling/wrap modes,

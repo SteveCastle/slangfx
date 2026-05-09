@@ -1,8 +1,12 @@
+---
+title: Slang shader format reference
+---
+
 # Slang shader format (libretro flavor)
 
 Reference notes for the format we consume. The canonical implementation is
 in [libretro/glslang](https://github.com/libretro/glslang) and the consumer
-is RetroArch's vulkan / glcore drivers. This doc summarizes what `vf_slang`
+is RetroArch's vulkan / glcore drivers. This doc summarizes what `slangfx`
 needs to support.
 
 ## File extensions
@@ -167,8 +171,8 @@ UBO field with `(w, h, 1/w, 1/h)`.
 ```
 
 Each declared parameter becomes a push-constant float in the `Push` block.
-`vf_slang` exposes them as a `key=value,...` filter option so users can
-override defaults from the command line.
+`slangfx` exposes them as a `--params 'key=value,...'` CLI option so users
+can override defaults from the command line.
 
 ### Format pragma
 

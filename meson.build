@@ -1,7 +1,7 @@
 project(
-  'vf-slang',
+  'slangfx',
   'c',
-  version: '0.0.1',
+  version: '0.1.0',
   license: 'MIT',
   default_options: [
     'c_std=c11',
@@ -25,15 +25,14 @@ add_project_arguments(
 # ---------------------------------------------------------------------------
 # Dependencies
 #
-# Phase 0 the binary uses no GPU code yet (the pipeline is an identity copy)
-# so Vulkan/shaderc are optional and will become required in Phase 1. ffmpeg
-# is intentionally NOT a dependency: vfslang reads raw RGBA from stdin and
-# writes raw RGBA to stdout, so demux/decode/encode/mux is delegated to the
-# user's existing ffmpeg via pipes (see wrappers/vfslang.py).
+# slangfx reads raw RGBA from stdin and writes raw RGBA to stdout; demux,
+# decode, encode and mux are delegated to ffmpeg via pipes (see
+# wrappers/slangfx.py for the orchestration). ffmpeg is therefore not a
+# build-time dependency — only a runtime one.
 #
-# Vulkan SDK on Windows: the SDK ships everything but no pkg-config file.
-# We probe VULKAN_SDK env var directly and fall back to the system include
-# path on Linux/macOS.
+# Vulkan SDK on Windows ships everything but no pkg-config file. We probe
+# the VULKAN_SDK env var directly and fall back to pkg-config on Linux /
+# macOS.
 # ---------------------------------------------------------------------------
 
 vulkan_sdk = get_option('vulkan_sdk')
@@ -48,8 +47,8 @@ if get_option('enable_gpu')
   if vulkan_sdk != ''
     vulkan_inc  = include_directories(vulkan_sdk / 'Include')
     vulkan_lib  = (host_sys == 'windows') ? 'vulkan-1' : 'vulkan'
-    # On Windows: prefer the shared-library import (`shaderc_shared.dll`).
-    # The static `shaderc_combined.lib` is 200+ MB of optimized C++ which
+    # On Windows: prefer the shared-library import (shaderc_shared.dll).
+    # The static shaderc_combined.lib is 200+ MB of optimized C++ which
     # takes minutes to link with MinGW's ld.bfd; the shared variant links
     # in seconds and the DLL is a small runtime dep we ship next to the
     # binary.
@@ -75,31 +74,32 @@ endif
 # Sources
 # ---------------------------------------------------------------------------
 
-vfslang_sources = files(
-  'src/vf_slang.c',
+slangfx_sources = files(
+  'src/main.c',
   'src/slangp.c',
   'src/slang_compile.c',
   'src/slang_pipeline.c',
   'src/spv_reflect.c',
 )
 
-vfslang_inc = include_directories('src')
+slangfx_inc = include_directories('src')
 
-vfslang_deps = []
-vfslang_args = []
+slangfx_deps = []
+slangfx_args = []
 if get_option('enable_gpu')
-  vfslang_deps += [vulkan_dep, shaderc_dep]
-  vfslang_args += ['-DVFSLANG_GPU=1']
+  slangfx_deps += [vulkan_dep, shaderc_dep]
+  slangfx_args += ['-DSLANGFX_GPU=1']
 endif
 
 # Standalone executable. Reads raw RGBA from stdin, writes raw RGBA to stdout.
-# See src/vf_slang.c for the protocol.
-vfslang_exe = executable(
-  'vfslang',
-  vfslang_sources,
-  include_directories: vfslang_inc,
-  dependencies: vfslang_deps,
-  c_args: vfslang_args,
+# See src/main.c for the I/O protocol; wrappers/slangfx.py orchestrates the
+# usual ffmpeg-decode | slangfx | ffmpeg-encode pipeline.
+slangfx_exe = executable(
+  'slangfx',
+  slangfx_sources,
+  include_directories: slangfx_inc,
+  dependencies: slangfx_deps,
+  c_args: slangfx_args,
   install: true,
 )
 
@@ -111,7 +111,7 @@ test_slangp_parse = executable(
   'test_slangp_parse',
   'tests/test_slangp_parse.c',
   'src/slangp.c',
-  include_directories: vfslang_inc,
+  include_directories: slangfx_inc,
   build_by_default: false,
 )
 

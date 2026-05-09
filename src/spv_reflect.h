@@ -1,5 +1,5 @@
 /*
- * vf-slang — minimal SPIR-V reflector.
+ * slangfx — minimal SPIR-V reflector.
  *
  * Walks a SPIR-V binary to extract just the slang shader contract surface:
  *   - the push-constant block: total size + every member's name + offset

@@ -1,5 +1,5 @@
 /*
- * vf-slang — Vulkan render pipeline.
+ * slangfx — Vulkan render pipeline.
  *
  * Owns the Vulkan device + per-pass framebuffers and graphics pipelines.
  * Manages the per-frame chain:

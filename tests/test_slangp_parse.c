@@ -1,5 +1,5 @@
 /*
- * vf-slang — .slangp parser tests.
+ * slangfx — .slangp parser tests.
  *
  * Run via:  meson test -C build slangp\ parser
  */
