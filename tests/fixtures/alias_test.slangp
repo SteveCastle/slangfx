@@ -1,0 +1,12 @@
+shaders = 2
+
+shader0 = invert.slang
+alias0 = step1
+filter_linear0 = false
+scale_type0 = source
+scale0 = 1.0
+
+shader1 = pass1_via_alias.slang
+filter_linear1 = false
+scale_type1 = source
+scale1 = 1.0

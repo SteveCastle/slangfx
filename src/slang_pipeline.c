@@ -122,6 +122,16 @@ struct pass_state {
     VkImageView    out_view;
     VkSampler      sampler;
 
+    /* Phase 6: PassFeedback. If any later pass references this pass's output
+     * as `PassFeedback<i>` or `<alias>Feedback`, we keep a snapshot of the
+     * previous frame's output here. After each frame's pipeline run, the
+     * current out_img is blitted into feedback_img so next frame consumers
+     * can sample "previous-frame pass<i>". */
+    bool           is_feedback_producer;
+    VkImage        feedback_img;
+    VkDeviceMemory feedback_mem;
+    VkImageView    feedback_view;
+
     VkRenderPass   render_pass;
     VkFramebuffer  framebuffer;
 
@@ -176,6 +186,27 @@ struct slang_pipeline {
     /* Multi-pass chain */
     struct pass_state *passes;
     size_t             num_passes;
+
+    /* Phase 8: external textures from `textures = "..."`. Loaded once at
+     * setup, bound into descriptor sets of any pass whose shader references
+     * the texture by name. */
+    struct ext_texture {
+        char          *name;
+        VkImage        img;
+        VkDeviceMemory mem;
+        VkImageView    view;
+        VkSampler      sampler;
+    } *ext_textures;
+    size_t num_ext_textures;
+
+    /* Alias resolution map (Phase 5b). For every preset pass that declared
+     * an `alias<i> = name`, we record (name, pass_idx) so downstream passes
+     * can bind it as a sampler by name. */
+    struct alias_entry {
+        char  *name;
+        size_t pass_idx;
+    } *aliases;
+    size_t num_aliases;
 
     uint32_t frame_count;
 };
@@ -344,6 +375,135 @@ static VkSamplerAddressMode wrap_to_vk(enum slangp_wrap_mode w)
 }
 
 /* -------------------------------------------------------------------------- */
+/* Sampler resolution (Phase 5b/c/d + Phase 6 + Phase 8)                       */
+/* -------------------------------------------------------------------------- */
+
+/* Match `name` against alias table. Returns pass index or -1. */
+static int find_alias(struct slang_pipeline *p, const char *name)
+{
+    if (!name) return -1;
+    for (size_t i = 0; i < p->num_aliases; ++i)
+        if (p->aliases[i].name && strcmp(p->aliases[i].name, name) == 0)
+            return (int)p->aliases[i].pass_idx;
+    return -1;
+}
+
+static int find_external_texture(struct slang_pipeline *p, const char *name)
+{
+    if (!name) return -1;
+    for (size_t i = 0; i < p->num_ext_textures; ++i)
+        if (p->ext_textures[i].name && strcmp(p->ext_textures[i].name, name) == 0)
+            return (int)i;
+    return -1;
+}
+
+/* True if `s` starts with `prefix`. */
+static bool startswith(const char *s, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return strncmp(s, prefix, n) == 0;
+}
+
+/* True if `s` ends with `suffix`. */
+static bool endswith(const char *s, const char *suffix)
+{
+    size_t n = strlen(s), m = strlen(suffix);
+    return m <= n && strcmp(s + n - m, suffix) == 0;
+}
+
+struct resolved_binding {
+    VkImageView view;
+    VkSampler   sampler;
+    bool        is_feedback;
+    int         feedback_pass;   /* producer pass index */
+};
+
+/* Resolve a sampler name to a (view, sampler) pair, marking feedback if
+ * applicable. `prev_view`/`prev_sampler` are the previous pass's output (or
+ * the input image, for pass 0). Returns 0 on success, -1 if unresolved. */
+static int resolve_sampler_name(struct slang_pipeline *p,
+                                size_t current_pass_idx,
+                                const char *name,
+                                VkImageView prev_view, VkSampler prev_sampler,
+                                struct resolved_binding *out)
+{
+    if (!name) return -1;
+    out->view = VK_NULL_HANDLE;
+    out->sampler = VK_NULL_HANDLE;
+    out->is_feedback = false;
+    out->feedback_pass = -1;
+
+    /* Source = previous pass output (or input for pass 0). */
+    if (strcmp(name, "Source") == 0) {
+        out->view = prev_view; out->sampler = prev_sampler;
+        return 0;
+    }
+    /* Original / OriginalHistory0 = the original input frame. Higher history
+     * (OriginalHistory1+) is Phase 9 work; treat as Original for now. */
+    if (strcmp(name, "Original") == 0 || startswith(name, "OriginalHistory")) {
+        out->view = p->in_view; out->sampler = p->in_sampler;
+        return 0;
+    }
+    /* PassFeedback<n> — feedback ring of pass n. */
+    if (startswith(name, "PassFeedback")) {
+        int n = atoi(name + strlen("PassFeedback"));
+        if (n >= 0 && (size_t)n < p->num_passes) {
+            p->passes[n].is_feedback_producer = true;
+            out->is_feedback = true;
+            out->feedback_pass = n;
+            /* view set later, after feedback image is allocated */
+            return 0;
+        }
+        return -1;
+    }
+    /* <alias>Feedback — feedback of an aliased pass. */
+    if (endswith(name, "Feedback") && strlen(name) > 8) {
+        char alias[256];
+        size_t n = strlen(name) - 8;
+        if (n >= sizeof(alias)) return -1;
+        memcpy(alias, name, n); alias[n] = '\0';
+        int pi = find_alias(p, alias);
+        if (pi >= 0) {
+            p->passes[pi].is_feedback_producer = true;
+            out->is_feedback = true;
+            out->feedback_pass = pi;
+            return 0;
+        }
+        return -1;
+    }
+    /* Pass<n> (numeric, this frame). */
+    if (startswith(name, "Pass")) {
+        const char *digits = name + 4;
+        if (*digits >= '0' && *digits <= '9') {
+            int n = atoi(digits);
+            if (n >= 0 && (size_t)n < p->num_passes) {
+                /* Self-reference would deadlock; downstream passes only. */
+                if ((size_t)n < current_pass_idx) {
+                    out->view = p->passes[n].out_view;
+                    out->sampler = p->passes[n].sampler;
+                    return 0;
+                }
+            }
+        }
+    }
+    /* alias name → that pass's output. */
+    int pi = find_alias(p, name);
+    if (pi >= 0 && (size_t)pi < current_pass_idx) {
+        out->view = p->passes[pi].out_view;
+        out->sampler = p->passes[pi].sampler;
+        return 0;
+    }
+    /* external texture (Phase 8). */
+    int ti = find_external_texture(p, name);
+    if (ti >= 0) {
+        out->view = p->ext_textures[ti].view;
+        out->sampler = p->ext_textures[ti].sampler;
+        return 0;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Per-pass setup                                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -376,26 +536,23 @@ static void resolve_pass_dims(const struct slangp_pass *ps,
     *h_out = (uint32_t)(fy + 0.5f);
 }
 
-static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
-                      const struct slangp_pass *ppass,
-                      uint32_t out_w, uint32_t out_h,
-                      VkImageView source_view, VkSampler source_sampler,
-                      char **err_out)
+/* Phase A: allocate the pass's output framebuffer image + its sampler. */
+static int alloc_pass_image(struct slang_pipeline *p, struct pass_state *ps,
+                            const struct slangp_pass *ppass,
+                            uint32_t out_w, uint32_t out_h, char **err_out)
 {
     ps->out_w = out_w;
     ps->out_h = out_h;
-
-    /* Pass framebuffer image. */
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
     if (create_image(p, out_w, out_h, FMT,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT |
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      &ps->out_img, &ps->out_mem, err_out) != 0) goto fail;
     ps->out_view = create_view(p->dev, ps->out_img, FMT);
     if (!ps->out_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (pass out)"); goto fail; }
 
-    /* Sampler with the per-pass filter/wrap config. */
     VkSamplerCreateInfo sci = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = (ppass && ppass->filter_linear) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
@@ -408,9 +565,34 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
         .unnormalizedCoordinates = VK_FALSE,
     };
     VK_CHECK(vkCreateSampler(p->dev, &sci, NULL, &ps->sampler), "vkCreateSampler (pass)");
-    (void)source_sampler;  /* current pass uses its OWN sampler for upstream
-                              reads; the previous pass's sampler is used by
-                              its OWN pass when it was the producer. */
+    return 0;
+fail: return -1;
+}
+
+/* Phase D: allocate the feedback snapshot image for a pass that has at
+ * least one downstream PassFeedback consumer. The image starts in
+ * UNDEFINED layout — first frame's `PassFeedback` reads will see whatever
+ * the implementation returns (we explicitly clear to black before first
+ * dispatch so the result is deterministic). */
+static int alloc_feedback_image(struct slang_pipeline *p, struct pass_state *ps,
+                                char **err_out)
+{
+    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
+    if (create_image(p, ps->out_w, ps->out_h, FMT,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                     &ps->feedback_img, &ps->feedback_mem, err_out) != 0) return -1;
+    ps->feedback_view = create_view(p->dev, ps->feedback_img, FMT);
+    if (!ps->feedback_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (feedback)"); return -1; }
+    return 0;
+}
+
+/* Phase F: build render pass + framebuffer + dynamic descriptor set layout
+ * + pipeline + descriptor set, using the pre-resolved sampler bindings. */
+static int build_pass_pipeline(struct slang_pipeline *p, struct pass_state *ps,
+                               const struct resolved_binding *bindings,
+                               size_t num_bindings, char **err_out)
+{
+    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
 
     /* Render pass. */
     VkAttachmentDescription att = {
@@ -420,9 +602,6 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        /* Final layout is SHADER_READ_ONLY so the next pass can sample.
-         * For the very last pass we still keep this; the readback path
-         * issues a layout transition to TRANSFER_SRC explicitly. */
         .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
@@ -446,35 +625,45 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
     VK_CHECK(vkCreateRenderPass(p->dev, &rpci, NULL, &ps->render_pass),
              "vkCreateRenderPass (pass)");
 
-    /* Framebuffer. */
     VkFramebufferCreateInfo fbci = {
         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass = ps->render_pass,
         .attachmentCount = 1, .pAttachments = &ps->out_view,
-        .width = out_w, .height = out_h, .layers = 1,
+        .width = ps->out_w, .height = ps->out_h, .layers = 1,
     };
     VK_CHECK(vkCreateFramebuffer(p->dev, &fbci, NULL, &ps->framebuffer),
              "vkCreateFramebuffer (pass)");
 
-    /* Descriptor set layout: UBO@0 + Source@2 (slang convention). */
-    VkDescriptorSetLayoutBinding bindings[2] = {
-        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          .descriptorCount = 1,
-          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          .descriptorCount = 1,
-          .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-    };
+    /* Dynamic descriptor set layout: UBO@0 + every reflected sampler at
+     * its declared binding number. */
+    size_t total_bindings = 1 + num_bindings;
+    VkDescriptorSetLayoutBinding *dsl_bindings = (VkDescriptorSetLayoutBinding *)
+        calloc(total_bindings, sizeof(*dsl_bindings));
+    if (!dsl_bindings) { if (err_out) *err_out = xstrdup("oom (dsl bindings)"); goto fail; }
+    dsl_bindings[0].binding = 0;
+    dsl_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    dsl_bindings[0].descriptorCount = 1;
+    dsl_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (size_t k = 0; k < num_bindings; ++k) {
+        dsl_bindings[1 + k].binding         = ps->mod->samplers[k].binding;
+        dsl_bindings[1 + k].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        dsl_bindings[1 + k].descriptorCount = 1;
+        dsl_bindings[1 + k].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo dlci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2, .pBindings = bindings,
+        .bindingCount = (uint32_t)total_bindings, .pBindings = dsl_bindings,
     };
-    VK_CHECK(vkCreateDescriptorSetLayout(p->dev, &dlci, NULL, &ps->dset_layout),
-             "vkCreateDescriptorSetLayout (pass)");
+    VkResult dlr = vkCreateDescriptorSetLayout(p->dev, &dlci, NULL, &ps->dset_layout);
+    free(dsl_bindings);
+    if (dlr != VK_SUCCESS) {
+        if (err_out) *err_out = err_fmt("vkCreateDescriptorSetLayout VkResult=%d", dlr);
+        goto fail;
+    }
 
     VkPushConstantRange pcr = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset = 0, .size = sizeof(struct slang_push),
+        .offset = 0, .size = 256,    /* slang push range; we push <=256 bytes */
     };
     VkPipelineLayoutCreateInfo plci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -484,7 +673,6 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
     VK_CHECK(vkCreatePipelineLayout(p->dev, &plci, NULL, &ps->pipe_layout),
              "vkCreatePipelineLayout (pass)");
 
-    /* Pipeline. */
     VkShaderModule vmod = create_shader(p->dev, ps->mod->vert_spv, ps->mod->vert_spv_words);
     VkShaderModule fmod = create_shader(p->dev, ps->mod->frag_spv, ps->mod->frag_spv_words);
     if (!vmod || !fmod) {
@@ -518,8 +706,8 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
-    VkViewport vp = { 0, 0, (float)out_w, (float)out_h, 0, 1 };
-    VkRect2D sc = { {0,0}, { out_w, out_h } };
+    VkViewport vp = { 0, 0, (float)ps->out_w, (float)ps->out_h, 0, 1 };
+    VkRect2D sc = { {0,0}, { ps->out_w, ps->out_h } };
     VkPipelineViewportStateCreateInfo vps = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1, .pViewports = &vp,
@@ -554,11 +742,11 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
     vkDestroyShaderModule(p->dev, vmod, NULL);
     vkDestroyShaderModule(p->dev, fmod, NULL);
     if (vr != VK_SUCCESS) {
-        if (err_out) *err_out = err_fmt("vkCreateGraphicsPipelines (pass) VkResult=%d", vr);
+        if (err_out) *err_out = err_fmt("vkCreateGraphicsPipelines VkResult=%d", vr);
         goto fail;
     }
 
-    /* Descriptor set + writes. */
+    /* Allocate descriptor set + write. */
     VkDescriptorSetAllocateInfo dsai = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = p->dpool, .descriptorSetCount = 1,
@@ -567,20 +755,43 @@ static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
     VK_CHECK(vkAllocateDescriptorSets(p->dev, &dsai, &ps->dset),
              "vkAllocateDescriptorSets (pass)");
 
+    /* Descriptor writes: UBO + each sampler. We use a heap array because the
+     * per-image descriptor info structs need to outlive the call. */
     VkDescriptorBufferInfo dbi = { .buffer = p->ubo, .offset = 0, .range = sizeof(struct slang_ubo) };
-    VkDescriptorImageInfo  dii = {
-        .sampler = ps->sampler, .imageView = source_view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VkDescriptorImageInfo *dii = (VkDescriptorImageInfo *)calloc(num_bindings, sizeof(*dii));
+    VkWriteDescriptorSet  *writes = (VkWriteDescriptorSet *)calloc(1 + num_bindings, sizeof(*writes));
+    if (!writes || (num_bindings > 0 && !dii)) {
+        if (err_out) *err_out = xstrdup("oom (descriptor writes)");
+        free(dii); free(writes);
+        goto fail;
+    }
+    writes[0] = (VkWriteDescriptorSet) {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
+        .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi,
     };
-    VkWriteDescriptorSet writes[2] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
-          .dstBinding = 0, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
-          .dstBinding = 2, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &dii },
-    };
-    vkUpdateDescriptorSets(p->dev, 2, writes, 0, NULL);
+    size_t valid_writes = 1;
+    for (size_t k = 0; k < num_bindings; ++k) {
+        if (!bindings[k].view) {
+            /* Unresolved sampler — skip. The shader read may produce
+             * undefined results, but the dispatch won't crash if the
+             * binding is in the layout but no descriptor is written.
+             * (Vulkan validation will warn; debug builds catch it.) */
+            continue;
+        }
+        dii[k].sampler     = bindings[k].sampler;
+        dii[k].imageView   = bindings[k].view;
+        dii[k].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        writes[valid_writes] = (VkWriteDescriptorSet) {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
+            .dstBinding = ps->mod->samplers[k].binding, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &dii[k],
+        };
+        ++valid_writes;
+    }
+    vkUpdateDescriptorSets(p->dev, (uint32_t)valid_writes, writes, 0, NULL);
+    free(dii); free(writes);
     return 0;
 fail: return -1;
 }
@@ -668,44 +879,156 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     };
     VK_CHECK(vkCreateDescriptorPool(p->dev, &dpci, NULL, &p->dpool), "vkCreateDescriptorPool");
 
-    /* Compile each pass's shader and build its pipeline. */
-    uint32_t prev_w = input_w, prev_h = input_h;
-    VkImageView prev_view    = p->in_view;
-    VkSampler   prev_sampler = p->in_sampler;
+    /* ---- Phase A: compile shaders + allocate output images per pass.    */
+    /* No descriptor sets, no pipelines yet — those need feedback         */
+    /* detection (Phase B/C) which itself needs all shaders compiled.     */
+    {
+        uint32_t prev_w = input_w, prev_h = input_h;
+        for (size_t i = 0; i < n_passes; ++i) {
+            struct pass_state *ps = &p->passes[i];
+            const struct slangp_pass *ppass = (preset && preset->num_passes > 0)
+                                              ? &preset->passes[i] : NULL;
+            char *cerr = NULL;
+            if (ppass && ppass->path) ps->mod = slang_compile_file(ppass->path, &cerr);
+            else                       ps->mod = slang_compile_string(BUILTIN_SLANG, NULL, &cerr);
+            if (!ps->mod) {
+                if (err_out) *err_out = err_fmt("compiling pass %zu (%s) failed: %s",
+                                                i, (ppass && ppass->path) ? ppass->path : "<built-in>",
+                                                cerr ? cerr : "(unknown)");
+                free(cerr);
+                goto fail;
+            }
+            if (preset && preset->num_params > 0) {
+                for (size_t k = 0; k < ps->mod->num_params; ++k)
+                    for (size_t m = 0; m < preset->num_params; ++m)
+                        if (preset->params[m].name && ps->mod->params[k].name &&
+                            strcmp(preset->params[m].name, ps->mod->params[k].name) == 0)
+                            ps->mod->params[k].default_value = preset->params[m].value;
+            }
+
+            uint32_t pw, ph;
+            if (ppass) resolve_pass_dims(ppass, prev_w, prev_h, output_w, output_h, &pw, &ph);
+            else       { pw = output_w; ph = output_h; }
+            if (i == n_passes - 1) { pw = output_w; ph = output_h; }
+
+            if (alloc_pass_image(p, ps, ppass, pw, ph, err_out) != 0) goto fail;
+
+            prev_w = pw; prev_h = ph;
+        }
+    }
+
+    /* ---- Phase B: build alias table from preset. ---- */
+    if (preset && preset->num_passes > 0) {
+        size_t na = 0;
+        for (size_t i = 0; i < preset->num_passes; ++i)
+            if (preset->passes[i].alias && *preset->passes[i].alias) ++na;
+        if (na > 0) {
+            p->aliases = (struct alias_entry *)calloc(na, sizeof(*p->aliases));
+            if (!p->aliases) { if (err_out) *err_out = xstrdup("oom (aliases)"); goto fail; }
+            p->num_aliases = na;
+            size_t ai = 0;
+            for (size_t i = 0; i < preset->num_passes; ++i) {
+                if (preset->passes[i].alias && *preset->passes[i].alias) {
+                    p->aliases[ai].name = xstrdup(preset->passes[i].alias);
+                    p->aliases[ai].pass_idx = i;
+                    ++ai;
+                }
+            }
+        }
+    }
+
+    /* ---- Phase C: resolve every reflected sampler in every pass.        */
+    /* This populates a per-pass `resolved_binding` array AND marks any   */
+    /* pass referenced via PassFeedback<i> / <alias>Feedback as a         */
+    /* feedback producer (so we know to allocate its feedback image).    */
+    struct resolved_binding **all_bindings = (struct resolved_binding **)
+        calloc(n_passes, sizeof(*all_bindings));
+    if (!all_bindings) { if (err_out) *err_out = xstrdup("oom (bindings)"); goto fail; }
+    {
+        VkImageView prev_view    = p->in_view;
+        VkSampler   prev_sampler = p->in_sampler;
+        for (size_t i = 0; i < n_passes; ++i) {
+            struct pass_state *ps = &p->passes[i];
+            size_t ns = ps->mod ? ps->mod->num_samplers : 0;
+            if (ns > 0) {
+                all_bindings[i] = (struct resolved_binding *)
+                    calloc(ns, sizeof(*all_bindings[i]));
+                if (!all_bindings[i]) {
+                    if (err_out) *err_out = xstrdup("oom (per-pass bindings)");
+                    goto cleanup_bindings;
+                }
+                for (size_t s = 0; s < ns; ++s) {
+                    const char *nm = ps->mod->samplers[s].name;
+                    if (resolve_sampler_name(p, i, nm,
+                                             prev_view, prev_sampler,
+                                             &all_bindings[i][s]) != 0) {
+                        /* Unresolved: leave view/sampler NULL — the
+                         * descriptor write step skips it. */
+                        if (err_out && !*err_out) {
+                            /* don't overwrite earlier errors */
+                        }
+                    }
+                }
+            }
+            prev_view    = ps->out_view;
+            prev_sampler = ps->sampler;
+        }
+    }
+
+    /* ---- Phase D: allocate feedback images for marked producers. ---- */
+    for (size_t i = 0; i < n_passes; ++i) {
+        if (p->passes[i].is_feedback_producer) {
+            if (alloc_feedback_image(p, &p->passes[i], err_out) != 0) goto cleanup_bindings;
+        }
+    }
+
+    /* ---- Phase E: patch feedback bindings with the now-allocated views. ---- */
+    for (size_t i = 0; i < n_passes; ++i) {
+        for (size_t s = 0; s < (p->passes[i].mod ? p->passes[i].mod->num_samplers : 0); ++s) {
+            struct resolved_binding *b = &all_bindings[i][s];
+            if (b->is_feedback && b->feedback_pass >= 0 &&
+                (size_t)b->feedback_pass < n_passes) {
+                b->view    = p->passes[b->feedback_pass].feedback_view;
+                b->sampler = p->passes[b->feedback_pass].sampler;
+            }
+        }
+    }
+
+    /* ---- Phase F: descriptor pool sized for all passes' bindings. ---- */
+    {
+        uint32_t total_ubo = (uint32_t)n_passes;
+        uint32_t total_samplers = 0;
+        for (size_t i = 0; i < n_passes; ++i)
+            if (p->passes[i].mod) total_samplers += (uint32_t)p->passes[i].mod->num_samplers;
+        if (total_samplers == 0) total_samplers = 1;  /* pool can't be empty */
+        VkDescriptorPoolSize ps_arr[2] = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, total_ubo },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, total_samplers },
+        };
+        VkDescriptorPoolCreateInfo dpci2 = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = total_ubo,
+            .poolSizeCount = 2, .pPoolSizes = ps_arr,
+        };
+        if (p->dpool) vkDestroyDescriptorPool(p->dev, p->dpool, NULL);
+        if (vkCreateDescriptorPool(p->dev, &dpci2, NULL, &p->dpool) != VK_SUCCESS) {
+            if (err_out) *err_out = xstrdup("vkCreateDescriptorPool (resized)");
+            goto cleanup_bindings;
+        }
+    }
+
+    /* ---- Phase F: build per-pass render pass + framebuffer + pipeline. ---- */
     for (size_t i = 0; i < n_passes; ++i) {
         struct pass_state *ps = &p->passes[i];
-        const struct slangp_pass *ppass = (preset && preset->num_passes > 0)
-                                          ? &preset->passes[i] : NULL;
-
-        /* Compile this pass's shader (or built-in for the empty preset). */
-        char *cerr = NULL;
-        if (ppass && ppass->path) {
-            ps->mod = slang_compile_file(ppass->path, &cerr);
-        } else {
-            ps->mod = slang_compile_string(BUILTIN_SLANG, NULL, &cerr);
-        }
-        if (!ps->mod) {
-            if (err_out) *err_out = err_fmt("compiling pass %zu (%s) failed: %s",
-                                            i, (ppass && ppass->path) ? ppass->path : "<built-in>",
-                                            cerr ? cerr : "(unknown)");
-            free(cerr);
-            goto fail;
-        }
-
-        /* Resolve dims. The final pass is forced to output_w x output_h so
-         * the readback buffer matches. (The slangp `viewport` scale type
-         * usually achieves this naturally; we coerce as a safety net.) */
-        uint32_t pw, ph;
-        if (ppass) resolve_pass_dims(ppass, prev_w, prev_h, output_w, output_h, &pw, &ph);
-        else       { pw = output_w; ph = output_h; }
-        if (i == n_passes - 1) { pw = output_w; ph = output_h; }
-
-        if (build_pass(p, ps, ppass, pw, ph, prev_view, prev_sampler, err_out) != 0) goto fail;
-
-        prev_w = pw; prev_h = ph;
-        prev_view    = ps->out_view;
-        prev_sampler = ps->sampler;
+        size_t ns = ps->mod ? ps->mod->num_samplers : 0;
+        if (build_pass_pipeline(p, ps, all_bindings[i], ns, err_out) != 0)
+            goto cleanup_bindings;
     }
+
+    /* Free the per-pass bindings scratch array. */
+    for (size_t i = 0; i < n_passes; ++i) free(all_bindings[i]);
+    free(all_bindings);
+    all_bindings = NULL;
 
     /* Command pool/buffer + fence. */
     VkCommandPoolCreateInfo cpci = {
@@ -724,6 +1047,11 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     VK_CHECK(vkCreateFence(p->dev, &fci, NULL, &p->fence), "vkCreateFence");
 
     return p;
+cleanup_bindings:
+    if (all_bindings) {
+        for (size_t i = 0; i < n_passes; ++i) free(all_bindings[i]);
+        free(all_bindings);
+    }
 fail:
     slang_pipeline_destroy(p);
     return NULL;
@@ -774,6 +1102,28 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     if (vkBeginCommandBuffer(p->cmd, &cbbi) != VK_SUCCESS) return -2;
+
+    /* Phase 6: First-frame feedback initialization. Each producer's
+     * feedback image starts in UNDEFINED layout with undefined contents;
+     * clear to opaque-black and transition to SHADER_READ_ONLY so the
+     * frame-0 PassFeedback samples return deterministic black. */
+    if (p->frame_count == 1) {
+        for (size_t i = 0; i < p->num_passes; ++i) {
+            if (!p->passes[i].is_feedback_producer) continue;
+            barrier(p->cmd, p->passes[i].feedback_img,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue cc = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+            VkImageSubresourceRange srr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(p->cmd, p->passes[i].feedback_img,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &srr);
+            barrier(p->cmd, p->passes[i].feedback_img,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
+    }
 
     /* Upload to in_img. */
     barrier(p->cmd, p->in_img,
@@ -902,12 +1252,58 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         prev_w = ps->out_w; prev_h = ps->out_h;
     }
 
-    /* Last pass output: SHADER_READ_ONLY -> TRANSFER_SRC, copy, restore. */
+    /* Phase 6: snapshot each feedback producer's output for next frame.
+     * Run BEFORE the last-pass readback so any producer (including the
+     * last pass itself) is captured cleanly. */
+    for (size_t i = 0; i < p->num_passes; ++i) {
+        struct pass_state *prod = &p->passes[i];
+        if (!prod->is_feedback_producer) continue;
+
+        barrier(p->cmd, prod->out_img,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(p->cmd, prod->feedback_img,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+        VkImageCopy copy = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .extent = { prod->out_w, prod->out_h, 1 },
+        };
+        vkCmdCopyImage(p->cmd,
+                       prod->out_img,      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       prod->feedback_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &copy);
+
+        /* Restore feedback_img to SHADER_READ_ONLY for next frame's reads. */
+        barrier(p->cmd, prod->feedback_img,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        /* Restore out_img to SHADER_READ_ONLY (unless it's the last pass —
+         * we'll transition that one to TRANSFER_SRC just below for readback). */
+        if (i != p->num_passes - 1) {
+            barrier(p->cmd, prod->out_img,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
+    }
+
+    /* Last pass output: SHADER_READ_ONLY -> TRANSFER_SRC, copy, restore.
+     * If the last pass was a feedback producer, we already transitioned
+     * its out_img to TRANSFER_SRC above; skip the redundant transition. */
     struct pass_state *last = &p->passes[p->num_passes - 1];
-    barrier(p->cmd, last->out_img,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    if (!last->is_feedback_producer) {
+        barrier(p->cmd, last->out_img,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    }
     VkBufferImageCopy bic2 = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { last->out_w, last->out_h, 1 },
@@ -941,15 +1337,18 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
 
 static void destroy_pass(VkDevice dev, struct pass_state *ps)
 {
-    if (ps->pipeline)     vkDestroyPipeline(dev, ps->pipeline, NULL);
-    if (ps->pipe_layout)  vkDestroyPipelineLayout(dev, ps->pipe_layout, NULL);
-    if (ps->dset_layout)  vkDestroyDescriptorSetLayout(dev, ps->dset_layout, NULL);
-    if (ps->framebuffer)  vkDestroyFramebuffer(dev, ps->framebuffer, NULL);
-    if (ps->render_pass)  vkDestroyRenderPass(dev, ps->render_pass, NULL);
-    if (ps->sampler)      vkDestroySampler(dev, ps->sampler, NULL);
-    if (ps->out_view)     vkDestroyImageView(dev, ps->out_view, NULL);
-    if (ps->out_img)      vkDestroyImage(dev, ps->out_img, NULL);
-    if (ps->out_mem)      vkFreeMemory(dev, ps->out_mem, NULL);
+    if (ps->pipeline)      vkDestroyPipeline(dev, ps->pipeline, NULL);
+    if (ps->pipe_layout)   vkDestroyPipelineLayout(dev, ps->pipe_layout, NULL);
+    if (ps->dset_layout)   vkDestroyDescriptorSetLayout(dev, ps->dset_layout, NULL);
+    if (ps->framebuffer)   vkDestroyFramebuffer(dev, ps->framebuffer, NULL);
+    if (ps->render_pass)   vkDestroyRenderPass(dev, ps->render_pass, NULL);
+    if (ps->sampler)       vkDestroySampler(dev, ps->sampler, NULL);
+    if (ps->feedback_view) vkDestroyImageView(dev, ps->feedback_view, NULL);
+    if (ps->feedback_img)  vkDestroyImage(dev, ps->feedback_img, NULL);
+    if (ps->feedback_mem)  vkFreeMemory(dev, ps->feedback_mem, NULL);
+    if (ps->out_view)      vkDestroyImageView(dev, ps->out_view, NULL);
+    if (ps->out_img)       vkDestroyImage(dev, ps->out_img, NULL);
+    if (ps->out_mem)       vkFreeMemory(dev, ps->out_mem, NULL);
     slang_module_free(ps->mod);
     /* dset is freed when descriptor pool is destroyed */
 }
@@ -985,6 +1384,18 @@ void slang_pipeline_destroy(struct slang_pipeline *p)
     if (p->in_view)      vkDestroyImageView(p->dev, p->in_view, NULL);
     if (p->in_img)       vkDestroyImage(p->dev, p->in_img, NULL);
     if (p->in_mem)       vkFreeMemory(p->dev, p->in_mem, NULL);
+
+    /* Aliases + external textures. */
+    for (size_t i = 0; i < p->num_aliases; ++i) free(p->aliases[i].name);
+    free(p->aliases);
+    for (size_t i = 0; i < p->num_ext_textures; ++i) {
+        free(p->ext_textures[i].name);
+        if (p->ext_textures[i].sampler) vkDestroySampler(p->dev, p->ext_textures[i].sampler, NULL);
+        if (p->ext_textures[i].view)    vkDestroyImageView(p->dev, p->ext_textures[i].view, NULL);
+        if (p->ext_textures[i].img)     vkDestroyImage(p->dev, p->ext_textures[i].img, NULL);
+        if (p->ext_textures[i].mem)     vkFreeMemory(p->dev, p->ext_textures[i].mem, NULL);
+    }
+    free(p->ext_textures);
 
     if (p->dev)          vkDestroyDevice(p->dev, NULL);
     if (p->instance)     vkDestroyInstance(p->instance, NULL);
