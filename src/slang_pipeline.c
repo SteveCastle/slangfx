@@ -1,26 +1,29 @@
 /*
  * vf-slang — Vulkan offscreen render pipeline.
  *
- * Phase 1: bring up VkInstance/VkDevice/queue + offscreen render-to-texture.
- * Phase 4: drive the pipeline with a slang shader.
+ * Phase 1: VkInstance/VkDevice + offscreen render-to-texture (single pass).
+ * Phase 4: pipeline driven by a real slang shader from a .slangp preset.
+ * Phase 5: multi-pass. Each .slangp pass becomes a `pass_state` holding its
+ *          own framebuffer image, render pass, graphics pipeline, and
+ *          descriptor set. Per frame, passes are dispatched in order; each
+ *          pass's `Source` sampler reads the previous pass's output (or
+ *          the original input for pass 0).
  *
- * The pipeline is set up to the libretro slang binding contract:
- *   set=0, binding=0   UBO (mat4 MVP and any UBO scalars from the shader)
- *   set=0, binding=2   sampler2D Source (current pass input)
- *   push_constant      Push { vec4 SourceSize, OriginalSize, OutputSize;
- *                              uint FrameCount; ...params... }
- *   vertex inputs      location 0 = vec4 Position, location 1 = vec2 TexCoord
+ * Slang binding contract (per pass):
+ *   set=0, binding=0   UBO (mat4 MVP, currently identity)
+ *   set=0, binding=2   sampler2D Source (previous pass output / input)
+ *   push_constant      slang_push { vec4 SourceSize, OriginalSize, OutputSize;
+ *                                    uint FrameCount; ...params... }
+ *   vertex             location 0 = vec4 Position, location 1 = vec2 TexCoord
  *
- * Per-frame:
- *   1. memcpy host RGBA into upload staging buffer
- *   2. record commands: layout barriers + image upload + render pass +
- *      image -> readback staging copy
- *   3. submit, wait fence
- *   4. memcpy readback staging -> host RGBA
+ * Phase 5 deferred (incrementally):
+ *   - aliases (`<alias>` sampler references)             — Phase 5b
+ *   - `Pass<n>` numeric pass refs                         — Phase 5c
+ *   - `Original` / `OriginalSize`                         — Phase 5d
  *
- * Phase 5/6 (multi-pass + PassFeedback) extend the per-frame block to
- * iterate over passes, manage a chain of intermediate framebuffers, and
- * flip ring-buffer slots for the feedback samplers.
+ * Phase 6 adds PassFeedback ring buffers; Phase 7 reflection so push
+ * constants honor shader-declared parameter offsets; Phase 8 external
+ * textures from `textures = "..."`; Phase 9 YUV input/output.
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -67,66 +70,33 @@ static char *err_fmt(const char *fmt, ...)
     }                                                                       \
 } while (0)
 
-/* Built-in slang shader used when no preset / empty preset is given.
- * Identical math to passthrough, but written in slang convention so the
- * pipeline's bindings/layout don't need a separate code path. */
 static const char *BUILTIN_SLANG =
     "#version 450\n"
-    "layout(std140, set = 0, binding = 0) uniform UBO {\n"
-    "    mat4 MVP;\n"
-    "} global;\n"
+    "layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;\n"
     "layout(push_constant) uniform Push {\n"
-    "    vec4 SourceSize;\n"
-    "    vec4 OriginalSize;\n"
-    "    vec4 OutputSize;\n"
-    "    uint FrameCount;\n"
+    "    vec4 SourceSize; vec4 OriginalSize; vec4 OutputSize; uint FrameCount;\n"
     "} params;\n"
-    "\n"
     "#pragma stage vertex\n"
-    "layout(location = 0) in vec4 Position;\n"
-    "layout(location = 1) in vec2 TexCoord;\n"
-    "layout(location = 0) out vec2 vUV;\n"
-    "void main() {\n"
-    "    gl_Position = global.MVP * Position;\n"
-    "    vUV = TexCoord;\n"
-    "}\n"
-    "\n"
+    "layout(location=0) in vec4 Position; layout(location=1) in vec2 TexCoord;\n"
+    "layout(location=0) out vec2 vUV;\n"
+    "void main() { gl_Position = global.MVP * Position; vUV = TexCoord; }\n"
     "#pragma stage fragment\n"
-    "layout(location = 0) in vec2 vUV;\n"
-    "layout(location = 0) out vec4 FragColor;\n"
-    "layout(set = 0, binding = 2) uniform sampler2D Source;\n"
-    "void main() {\n"
-    "    FragColor = texture(Source, vUV);\n"
-    "}\n";
+    "layout(location=0) in vec2 vUV; layout(location=0) out vec4 FragColor;\n"
+    "layout(set=0, binding=2) uniform sampler2D Source;\n"
+    "void main() { FragColor = texture(Source, vUV); }\n";
 
-/* Standard push-constant header used to drive shaders in Phase 4. The full
- * 128-byte layout matches the slang convention's first 52 bytes; everything
- * past offset 52 is reserved for shader-declared parameters and will be
- * populated once Phase 7 reflection lands. */
 struct slang_push {
-    float    source_size  [4];   /* offset 0:  (w, h, 1/w, 1/h) of Source */
-    float    original_size[4];   /* offset 16 */
-    float    output_size  [4];   /* offset 32 */
-    uint32_t frame_count;        /* offset 48 */
-    uint32_t _pad0;              /* offset 52 — keep struct 16-byte aligned */
-    float    reserved     [16];  /* parameter slots, all zero in Phase 4 */
+    float    source_size  [4];
+    float    original_size[4];
+    float    output_size  [4];
+    uint32_t frame_count;
+    uint32_t _pad0;
+    float    reserved     [16];
 };
 
-struct slang_ubo {
-    float MVP[16];               /* identity in Phase 4 */
-};
+struct slang_ubo { float MVP[16]; };
 
-/* Vertex layout matches slang's expected attributes:
- *   location 0 = vec4 Position (NDC-space xyzw)
- *   location 1 = vec2 TexCoord */
-struct vertex {
-    float pos[4];
-    float uv[2];
-};
-
-/* Fullscreen quad. NDC origin is center; Vulkan NDC has +y down so vertex
- * order picks UV (0,0) at NDC (-1,-1) which in Vulkan is the top-left of
- * the framebuffer. */
+struct vertex { float pos[4]; float uv[2]; };
 static const struct vertex QUAD_VERTS[4] = {
     { { -1.0f, -1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f } },
     { {  1.0f, -1.0f, 0.0f, 1.0f }, { 1.0f, 0.0f } },
@@ -136,37 +106,56 @@ static const struct vertex QUAD_VERTS[4] = {
 static const uint16_t QUAD_INDICES[6] = { 0, 1, 2,  0, 2, 3 };
 
 /* -------------------------------------------------------------------------- */
+/* Per-pass state                                                             */
+/* -------------------------------------------------------------------------- */
+
+struct pass_state {
+    struct slang_module *mod;
+    uint32_t out_w, out_h;
+
+    /* The pass's framebuffer image (= this pass's output, = next pass's
+     * Source). Always created with COLOR_ATTACHMENT + SAMPLED + TRANSFER_SRC
+     * so it can serve all three roles (write target, sampled by next pass,
+     * copied to readback for the final pass). */
+    VkImage        out_img;
+    VkDeviceMemory out_mem;
+    VkImageView    out_view;
+    VkSampler      sampler;
+
+    VkRenderPass   render_pass;
+    VkFramebuffer  framebuffer;
+
+    VkDescriptorSetLayout dset_layout;
+    VkPipelineLayout      pipe_layout;
+    VkPipeline            pipeline;
+    VkDescriptorSet       dset;
+};
+
+/* -------------------------------------------------------------------------- */
 /* Pipeline state                                                             */
 /* -------------------------------------------------------------------------- */
 
 struct slang_pipeline {
-    /* Dimensions. */
-    unsigned input_w, input_h;
-    unsigned output_w, output_h;
-
-    /* Vulkan core. */
+    /* Core */
     VkInstance       instance;
     VkPhysicalDevice phys;
     VkDevice         dev;
     uint32_t         queue_family;
     VkQueue          queue;
     VkPhysicalDeviceMemoryProperties mem_props;
-
-    /* Command pool / buffer / fence. */
     VkCommandPool   cmd_pool;
     VkCommandBuffer cmd;
     VkFence         fence;
 
-    /* Input image (sampled) and output image (color attachment). */
+    /* I/O */
+    unsigned input_w, input_h;
+    unsigned output_w, output_h;
+
     VkImage        in_img;
     VkDeviceMemory in_mem;
     VkImageView    in_view;
-    VkSampler      in_sampler;
-    VkImage        out_img;
-    VkDeviceMemory out_mem;
-    VkImageView    out_view;
+    VkSampler      in_sampler;       /* sampler used for the original input */
 
-    /* Staging buffers. */
     VkBuffer       stg_upload;
     VkDeviceMemory stg_upload_mem;
     void          *stg_upload_ptr;
@@ -174,36 +163,21 @@ struct slang_pipeline {
     VkDeviceMemory stg_readback_mem;
     void          *stg_readback_ptr;
 
-    /* Vertex / index buffers (fullscreen quad). */
+    /* Shared resources */
     VkBuffer       vbuf;
     VkDeviceMemory vbuf_mem;
     VkBuffer       ibuf;
     VkDeviceMemory ibuf_mem;
-
-    /* UBO buffer (mat4 MVP — host-visible so we can write the identity at
-     * setup; never changes). */
     VkBuffer       ubo;
     VkDeviceMemory ubo_mem;
     void          *ubo_ptr;
+    VkDescriptorPool dpool;
 
-    /* Render pass + framebuffer. */
-    VkRenderPass  render_pass;
-    VkFramebuffer framebuffer;
+    /* Multi-pass chain */
+    struct pass_state *passes;
+    size_t             num_passes;
 
-    /* Pipeline state. */
-    VkDescriptorSetLayout dset_layout;
-    VkPipelineLayout      pipe_layout;
-    VkPipeline            pipeline;
-    VkDescriptorPool      dpool;
-    VkDescriptorSet       dset;
-
-    /* Frame counter for the FrameCount push constant. */
     uint32_t frame_count;
-
-    /* Owning ref to the compiled slang module so its SPIR-V outlives the
-     * VkShaderModules it spawned. (The VkShaderModules are destroyed after
-     * pipeline creation — only the SPIR-V bytecode in `mod` persists.) */
-    struct slang_module *mod;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -215,8 +189,7 @@ static uint32_t find_memtype(const VkPhysicalDeviceMemoryProperties *mp,
 {
     for (uint32_t i = 0; i < mp->memoryTypeCount; ++i)
         if ((req & (1u << i)) &&
-            (mp->memoryTypes[i].propertyFlags & props) == props)
-            return i;
+            (mp->memoryTypes[i].propertyFlags & props) == props) return i;
     return UINT32_MAX;
 }
 
@@ -225,7 +198,7 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
     VkApplicationInfo ai = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "vfslang", .applicationVersion = 1,
-        .pEngineName      = "vfslang", .engineVersion      = 1,
+        .pEngineName = "vfslang", .engineVersion = 1,
         .apiVersion = VK_API_VERSION_1_3,
     };
     VkInstanceCreateInfo ici = {
@@ -236,7 +209,10 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
 
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(p->instance, &n, NULL);
-    if (n == 0) { if (err_out) *err_out = xstrdup("no Vulkan physical devices"); goto fail; }
+    if (n == 0) {
+        if (err_out) *err_out = xstrdup("no Vulkan physical devices");
+        goto fail;
+    }
     VkPhysicalDevice devs[16];
     if (n > 16) n = 16;
     vkEnumeratePhysicalDevices(p->instance, &n, devs);
@@ -244,7 +220,9 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
     for (uint32_t i = 0; i < n; ++i) {
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(devs[i], &pp);
-        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { p->phys = devs[i]; break; }
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            p->phys = devs[i]; break;
+        }
     }
 
     uint32_t qn = 0;
@@ -253,9 +231,12 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
     vkGetPhysicalDeviceQueueFamilyProperties(p->phys, &qn, qp);
     p->queue_family = UINT32_MAX;
     for (uint32_t i = 0; i < qn; ++i)
-        if (qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { p->queue_family = i; break; }
+        if (qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            p->queue_family = i; break;
+        }
     if (p->queue_family == UINT32_MAX) {
-        if (err_out) *err_out = xstrdup("no graphics queue family"); goto fail;
+        if (err_out) *err_out = xstrdup("no graphics queue family");
+        goto fail;
     }
 
     float prio = 1.0f;
@@ -272,13 +253,13 @@ static int init_instance_and_device(struct slang_pipeline *p, char **err_out)
     vkGetDeviceQueue(p->dev, p->queue_family, 0, &p->queue);
     vkGetPhysicalDeviceMemoryProperties(p->phys, &p->mem_props);
     return 0;
-fail:
-    return -1;
+fail: return -1;
 }
 
 static int create_image(struct slang_pipeline *p, uint32_t w, uint32_t h,
                         VkFormat fmt, VkImageUsageFlags usage,
-                        VkImage *img_out, VkDeviceMemory *mem_out, char **err_out)
+                        VkImage *img_out, VkDeviceMemory *mem_out,
+                        char **err_out)
 {
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -289,11 +270,9 @@ static int create_image(struct slang_pipeline *p, uint32_t w, uint32_t h,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     VK_CHECK(vkCreateImage(p->dev, &ici, NULL, img_out), "vkCreateImage");
-
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(p->dev, *img_out, &mr);
     uint32_t mt = find_memtype(&p->mem_props, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mt == UINT32_MAX) { if (err_out) *err_out = xstrdup("no device-local memory for image"); goto fail; }
-
+    if (mt == UINT32_MAX) { if (err_out) *err_out = xstrdup("no DEVICE_LOCAL memory"); goto fail; }
     VkMemoryAllocateInfo mai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = mr.size, .memoryTypeIndex = mt,
@@ -305,8 +284,7 @@ fail: return -1;
 }
 
 static int create_buffer(struct slang_pipeline *p, VkDeviceSize size,
-                         VkBufferUsageFlags usage,
-                         VkMemoryPropertyFlags props,
+                         VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
                          VkBuffer *buf_out, VkDeviceMemory *mem_out,
                          void **mapped_out, char **err_out)
 {
@@ -318,7 +296,7 @@ static int create_buffer(struct slang_pipeline *p, VkDeviceSize size,
     VK_CHECK(vkCreateBuffer(p->dev, &bci, NULL, buf_out), "vkCreateBuffer");
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(p->dev, *buf_out, &mr);
     uint32_t mt = find_memtype(&p->mem_props, mr.memoryTypeBits, props);
-    if (mt == UINT32_MAX) { if (err_out) *err_out = xstrdup("no compatible memory for buffer"); goto fail; }
+    if (mt == UINT32_MAX) { if (err_out) *err_out = xstrdup("no compatible buffer memory"); goto fail; }
     VkMemoryAllocateInfo mai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = mr.size, .memoryTypeIndex = mt,
@@ -336,8 +314,6 @@ static VkImageView create_view(VkDevice d, VkImage img, VkFormat fmt)
     VkImageViewCreateInfo ivci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
-        .components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
     };
     VkImageView v = VK_NULL_HANDLE;
@@ -345,16 +321,109 @@ static VkImageView create_view(VkDevice d, VkImage img, VkFormat fmt)
     return v;
 }
 
-static int create_render_pass(struct slang_pipeline *p, VkFormat fmt, char **err_out)
+static VkShaderModule create_shader(VkDevice d, const uint32_t *spv, size_t words)
 {
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = words * 4, .pCode = spv,
+    };
+    VkShaderModule m = VK_NULL_HANDLE;
+    vkCreateShaderModule(d, &smci, NULL, &m);
+    return m;
+}
+
+static VkSamplerAddressMode wrap_to_vk(enum slangp_wrap_mode w)
+{
+    switch (w) {
+        case SLANGP_WRAP_CLAMP_TO_EDGE:   return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        case SLANGP_WRAP_REPEAT:          return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        case SLANGP_WRAP_MIRRORED_REPEAT: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        case SLANGP_WRAP_CLAMP_TO_BORDER:
+        default:                          return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Per-pass setup                                                             */
+/* -------------------------------------------------------------------------- */
+
+/* Resolve a pass's output dimensions from its slangp scale rules.
+ * `prev_w/h` is the previous pass's output (or the input frame for pass 0).
+ * `final_w/h` is the final viewport (downstream output of vfslang).
+ *
+ * For per-axis rules we honor scale_type_x/scale_type_y separately. */
+static void resolve_pass_dims(const struct slangp_pass *ps,
+                              uint32_t prev_w, uint32_t prev_h,
+                              uint32_t final_w, uint32_t final_h,
+                              uint32_t *w_out, uint32_t *h_out)
+{
+    float fx = 0, fy = 0;
+    switch (ps->scale_type_x) {
+        case SLANGP_SCALE_VIEWPORT: fx = (float)final_w * ps->scale_x; break;
+        case SLANGP_SCALE_ABSOLUTE: fx = ps->scale_x;                   break;
+        case SLANGP_SCALE_SOURCE:
+        default:                    fx = (float)prev_w  * ps->scale_x; break;
+    }
+    switch (ps->scale_type_y) {
+        case SLANGP_SCALE_VIEWPORT: fy = (float)final_h * ps->scale_y; break;
+        case SLANGP_SCALE_ABSOLUTE: fy = ps->scale_y;                   break;
+        case SLANGP_SCALE_SOURCE:
+        default:                    fy = (float)prev_h  * ps->scale_y; break;
+    }
+    if (fx < 1.0f) fx = 1.0f;
+    if (fy < 1.0f) fy = 1.0f;
+    *w_out = (uint32_t)(fx + 0.5f);
+    *h_out = (uint32_t)(fy + 0.5f);
+}
+
+static int build_pass(struct slang_pipeline *p, struct pass_state *ps,
+                      const struct slangp_pass *ppass,
+                      uint32_t out_w, uint32_t out_h,
+                      VkImageView source_view, VkSampler source_sampler,
+                      char **err_out)
+{
+    ps->out_w = out_w;
+    ps->out_h = out_h;
+
+    /* Pass framebuffer image. */
+    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
+    if (create_image(p, out_w, out_h, FMT,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     &ps->out_img, &ps->out_mem, err_out) != 0) goto fail;
+    ps->out_view = create_view(p->dev, ps->out_img, FMT);
+    if (!ps->out_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (pass out)"); goto fail; }
+
+    /* Sampler with the per-pass filter/wrap config. */
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = (ppass && ppass->filter_linear) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = (ppass && ppass->filter_linear) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
+        .addressModeV = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
+        .addressModeW = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        .unnormalizedCoordinates = VK_FALSE,
+    };
+    VK_CHECK(vkCreateSampler(p->dev, &sci, NULL, &ps->sampler), "vkCreateSampler (pass)");
+    (void)source_sampler;  /* current pass uses its OWN sampler for upstream
+                              reads; the previous pass's sampler is used by
+                              its OWN pass when it was the producer. */
+
+    /* Render pass. */
     VkAttachmentDescription att = {
-        .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .format = FMT, .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /* Final layout is SHADER_READ_ONLY so the next pass can sample.
+         * For the very last pass we still keep this; the readback path
+         * issues a layout transition to TRANSFER_SRC explicitly. */
+        .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkSubpassDescription sub = {
@@ -374,31 +443,20 @@ static int create_render_pass(struct slang_pipeline *p, VkFormat fmt, char **err
         .subpassCount = 1, .pSubpasses = &sub,
         .dependencyCount = 1, .pDependencies = &dep,
     };
-    VK_CHECK(vkCreateRenderPass(p->dev, &rpci, NULL, &p->render_pass), "vkCreateRenderPass");
-    return 0;
-fail: return -1;
-}
+    VK_CHECK(vkCreateRenderPass(p->dev, &rpci, NULL, &ps->render_pass),
+             "vkCreateRenderPass (pass)");
 
-static VkShaderModule create_shader(VkDevice d, const uint32_t *spv, size_t words)
-{
-    VkShaderModuleCreateInfo smci = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = words * 4, .pCode = spv,
+    /* Framebuffer. */
+    VkFramebufferCreateInfo fbci = {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = ps->render_pass,
+        .attachmentCount = 1, .pAttachments = &ps->out_view,
+        .width = out_w, .height = out_h, .layers = 1,
     };
-    VkShaderModule m = VK_NULL_HANDLE;
-    vkCreateShaderModule(d, &smci, NULL, &m);
-    return m;
-}
+    VK_CHECK(vkCreateFramebuffer(p->dev, &fbci, NULL, &ps->framebuffer),
+             "vkCreateFramebuffer (pass)");
 
-/* -------------------------------------------------------------------------- */
-/* Pipeline construction (slang convention)                                   */
-/* -------------------------------------------------------------------------- */
-
-static int create_pipeline(struct slang_pipeline *p, char **err_out)
-{
-    /* Descriptor set layout: UBO @ binding 0 + sampler @ binding 2.
-     * (Binding 1 is unused — slang reserves it; we leave a gap rather than
-     * collapse, so shaders can be built unmodified.) */
+    /* Descriptor set layout: UBO@0 + Source@2 (slang convention). */
     VkDescriptorSetLayoutBinding bindings[2] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
           .descriptorCount = 1,
@@ -411,28 +469,26 @@ static int create_pipeline(struct slang_pipeline *p, char **err_out)
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 2, .pBindings = bindings,
     };
-    VK_CHECK(vkCreateDescriptorSetLayout(p->dev, &dlci, NULL, &p->dset_layout),
-             "vkCreateDescriptorSetLayout");
+    VK_CHECK(vkCreateDescriptorSetLayout(p->dev, &dlci, NULL, &ps->dset_layout),
+             "vkCreateDescriptorSetLayout (pass)");
 
-    /* Pipeline layout: descriptor set + push constant range covering the
-     * entire slang_push struct (visible to both stages). */
     VkPushConstantRange pcr = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0, .size = sizeof(struct slang_push),
     };
     VkPipelineLayoutCreateInfo plci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1, .pSetLayouts = &p->dset_layout,
+        .setLayoutCount = 1, .pSetLayouts = &ps->dset_layout,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr,
     };
-    VK_CHECK(vkCreatePipelineLayout(p->dev, &plci, NULL, &p->pipe_layout),
-             "vkCreatePipelineLayout");
+    VK_CHECK(vkCreatePipelineLayout(p->dev, &plci, NULL, &ps->pipe_layout),
+             "vkCreatePipelineLayout (pass)");
 
-    /* Shader modules from the slang module's SPIR-V. */
-    VkShaderModule vmod = create_shader(p->dev, p->mod->vert_spv, p->mod->vert_spv_words);
-    VkShaderModule fmod = create_shader(p->dev, p->mod->frag_spv, p->mod->frag_spv_words);
+    /* Pipeline. */
+    VkShaderModule vmod = create_shader(p->dev, ps->mod->vert_spv, ps->mod->vert_spv_words);
+    VkShaderModule fmod = create_shader(p->dev, ps->mod->frag_spv, ps->mod->frag_spv_words);
     if (!vmod || !fmod) {
-        if (err_out) *err_out = xstrdup("vkCreateShaderModule failed");
+        if (err_out) *err_out = xstrdup("vkCreateShaderModule failed (pass)");
         if (vmod) vkDestroyShaderModule(p->dev, vmod, NULL);
         if (fmod) vkDestroyShaderModule(p->dev, fmod, NULL);
         goto fail;
@@ -443,8 +499,6 @@ static int create_pipeline(struct slang_pipeline *p, char **err_out)
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fmod, .pName = "main" },
     };
-
-    /* Vertex input state. */
     VkVertexInputBindingDescription vib = {
         .binding = 0, .stride = sizeof(struct vertex),
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
@@ -464,8 +518,8 @@ static int create_pipeline(struct slang_pipeline *p, char **err_out)
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
-    VkViewport vp = { 0, 0, (float)p->output_w, (float)p->output_h, 0, 1 };
-    VkRect2D sc = { {0,0}, { p->output_w, p->output_h } };
+    VkViewport vp = { 0, 0, (float)out_w, (float)out_h, 0, 1 };
+    VkRect2D sc = { {0,0}, { out_w, out_h } };
     VkPipelineViewportStateCreateInfo vps = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1, .pViewports = &vp,
@@ -491,22 +545,42 @@ static int create_pipeline(struct slang_pipeline *p, char **err_out)
     VkGraphicsPipelineCreateInfo gpci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = stages,
-        .pVertexInputState   = &vis,
-        .pInputAssemblyState = &ias,
-        .pViewportState      = &vps,
-        .pRasterizationState = &rs,
-        .pMultisampleState   = &ms,
-        .pColorBlendState    = &cbs,
-        .layout = p->pipe_layout,
-        .renderPass = p->render_pass, .subpass = 0,
+        .pVertexInputState = &vis, .pInputAssemblyState = &ias,
+        .pViewportState = &vps, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &cbs,
+        .layout = ps->pipe_layout, .renderPass = ps->render_pass, .subpass = 0,
     };
-    VkResult vr = vkCreateGraphicsPipelines(p->dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipeline);
+    VkResult vr = vkCreateGraphicsPipelines(p->dev, VK_NULL_HANDLE, 1, &gpci, NULL, &ps->pipeline);
     vkDestroyShaderModule(p->dev, vmod, NULL);
     vkDestroyShaderModule(p->dev, fmod, NULL);
     if (vr != VK_SUCCESS) {
-        if (err_out) *err_out = err_fmt("vkCreateGraphicsPipelines (VkResult=%d)", vr);
+        if (err_out) *err_out = err_fmt("vkCreateGraphicsPipelines (pass) VkResult=%d", vr);
         goto fail;
     }
+
+    /* Descriptor set + writes. */
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = p->dpool, .descriptorSetCount = 1,
+        .pSetLayouts = &ps->dset_layout,
+    };
+    VK_CHECK(vkAllocateDescriptorSets(p->dev, &dsai, &ps->dset),
+             "vkAllocateDescriptorSets (pass)");
+
+    VkDescriptorBufferInfo dbi = { .buffer = p->ubo, .offset = 0, .range = sizeof(struct slang_ubo) };
+    VkDescriptorImageInfo  dii = {
+        .sampler = ps->sampler, .imageView = source_view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet writes[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
+          .dstBinding = 0, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ps->dset,
+          .dstBinding = 2, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &dii },
+    };
+    vkUpdateDescriptorSets(p->dev, 2, writes, 0, NULL);
     return 0;
 fail: return -1;
 }
@@ -525,49 +599,28 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     p->input_w = input_w;   p->input_h  = input_h;
     p->output_w = output_w; p->output_h = output_h;
 
-    /* Compile the shader: prefer the preset's first pass; fall back to the
-     * built-in passthrough so the binary is always invocable end-to-end. */
-    if (preset && preset->num_passes > 0 && preset->passes[0].path) {
-        char *cerr = NULL;
-        p->mod = slang_compile_file(preset->passes[0].path, &cerr);
-        if (!p->mod) {
-            if (err_out) *err_out = err_fmt("compiling '%s' failed: %s",
-                                            preset->passes[0].path,
-                                            cerr ? cerr : "(unknown)");
-            free(cerr);
-            goto fail;
-        }
-    } else {
-        p->mod = slang_compile_string(BUILTIN_SLANG, NULL, err_out);
-        if (!p->mod) goto fail;
-    }
-
     if (init_instance_and_device(p, err_out) != 0) goto fail;
 
-    /* Pass 1 of multi-pass support: 5 phases away. For now images at I/O
-     * size; intermediate framebuffers added in Phase 5. */
+    /* Shared resources: input image + sampler, staging buffers, vertex/index
+     * buffers, UBO, descriptor pool. */
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
     if (create_image(p, input_w, input_h, FMT,
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                      &p->in_img, &p->in_mem, err_out) != 0) goto fail;
-    if (create_image(p, output_w, output_h, FMT,
-                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                     &p->out_img, &p->out_mem, err_out) != 0) goto fail;
-    p->in_view  = create_view(p->dev, p->in_img,  FMT);
-    p->out_view = create_view(p->dev, p->out_img, FMT);
+    p->in_view = create_view(p->dev, p->in_img, FMT);
+    {
+        VkSamplerCreateInfo sci = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .unnormalizedCoordinates = VK_FALSE,
+        };
+        VK_CHECK(vkCreateSampler(p->dev, &sci, NULL, &p->in_sampler), "vkCreateSampler (in)");
+    }
 
-    VkSamplerCreateInfo sci = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .unnormalizedCoordinates = VK_FALSE,
-    };
-    VK_CHECK(vkCreateSampler(p->dev, &sci, NULL, &p->in_sampler), "vkCreateSampler");
-
-    /* Staging buffers. */
     VkDeviceSize ubytes = (VkDeviceSize)input_w  * input_h  * 4;
     VkDeviceSize rbytes = (VkDeviceSize)output_w * output_h * 4;
     if (create_buffer(p, ubytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -577,87 +630,82 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->stg_readback, &p->stg_readback_mem, &p->stg_readback_ptr, err_out) != 0) goto fail;
 
-    /* Vertex + index buffers. Both DEVICE_LOCAL would be ideal; for
-     * Phase 4 we use HOST_VISIBLE so we don't need to introduce another
-     * staging round-trip just to upload a constant 96-byte quad. */
-    if (create_buffer(p, sizeof(QUAD_VERTS),
-                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+    if (create_buffer(p, sizeof(QUAD_VERTS), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->vbuf, &p->vbuf_mem, NULL, err_out) != 0) goto fail;
-    {
-        void *m;
-        VK_CHECK(vkMapMemory(p->dev, p->vbuf_mem, 0, sizeof(QUAD_VERTS), 0, &m), "map vbuf");
-        memcpy(m, QUAD_VERTS, sizeof(QUAD_VERTS));
-        vkUnmapMemory(p->dev, p->vbuf_mem);
-    }
-    if (create_buffer(p, sizeof(QUAD_INDICES),
-                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+    { void *m; VK_CHECK(vkMapMemory(p->dev, p->vbuf_mem, 0, sizeof(QUAD_VERTS), 0, &m), "map vbuf");
+      memcpy(m, QUAD_VERTS, sizeof(QUAD_VERTS)); vkUnmapMemory(p->dev, p->vbuf_mem); }
+    if (create_buffer(p, sizeof(QUAD_INDICES), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->ibuf, &p->ibuf_mem, NULL, err_out) != 0) goto fail;
-    {
-        void *m;
-        VK_CHECK(vkMapMemory(p->dev, p->ibuf_mem, 0, sizeof(QUAD_INDICES), 0, &m), "map ibuf");
-        memcpy(m, QUAD_INDICES, sizeof(QUAD_INDICES));
-        vkUnmapMemory(p->dev, p->ibuf_mem);
-    }
+    { void *m; VK_CHECK(vkMapMemory(p->dev, p->ibuf_mem, 0, sizeof(QUAD_INDICES), 0, &m), "map ibuf");
+      memcpy(m, QUAD_INDICES, sizeof(QUAD_INDICES)); vkUnmapMemory(p->dev, p->ibuf_mem); }
 
-    /* UBO with identity MVP. */
-    if (create_buffer(p, sizeof(struct slang_ubo),
-                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+    if (create_buffer(p, sizeof(struct slang_ubo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->ubo, &p->ubo_mem, &p->ubo_ptr, err_out) != 0) goto fail;
     {
         struct slang_ubo u = {0};
-        u.MVP[0] = 1.0f; u.MVP[5]  = 1.0f;
-        u.MVP[10] = 1.0f; u.MVP[15] = 1.0f;
+        u.MVP[0] = 1.0f; u.MVP[5] = 1.0f; u.MVP[10] = 1.0f; u.MVP[15] = 1.0f;
         memcpy(p->ubo_ptr, &u, sizeof(u));
     }
 
-    /* Render pass + framebuffer. */
-    if (create_render_pass(p, FMT, err_out) != 0) goto fail;
-    VkFramebufferCreateInfo fbci = {
-        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass = p->render_pass,
-        .attachmentCount = 1, .pAttachments = &p->out_view,
-        .width = output_w, .height = output_h, .layers = 1,
-    };
-    VK_CHECK(vkCreateFramebuffer(p->dev, &fbci, NULL, &p->framebuffer), "vkCreateFramebuffer");
+    /* Determine pass count (built-in passthrough if 0). */
+    size_t n_passes = (preset && preset->num_passes > 0) ? preset->num_passes : 1;
+    p->passes = (struct pass_state *)calloc(n_passes, sizeof(*p->passes));
+    if (!p->passes) { if (err_out) *err_out = xstrdup("oom (passes)"); goto fail; }
+    p->num_passes = n_passes;
 
-    if (create_pipeline(p, err_out) != 0) goto fail;
-
-    /* Descriptor pool/set + writes. */
-    VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
+    /* Descriptor pool: enough for all passes + future feedback bindings. */
+    VkDescriptorPoolSize pool_sizes[2] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,        (uint32_t)n_passes },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,(uint32_t)n_passes },
     };
     VkDescriptorPoolCreateInfo dpci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps,
+        .maxSets = (uint32_t)n_passes,
+        .poolSizeCount = 2, .pPoolSizes = pool_sizes,
     };
     VK_CHECK(vkCreateDescriptorPool(p->dev, &dpci, NULL, &p->dpool), "vkCreateDescriptorPool");
-    VkDescriptorSetAllocateInfo dsai = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = p->dpool, .descriptorSetCount = 1,
-        .pSetLayouts = &p->dset_layout,
-    };
-    VK_CHECK(vkAllocateDescriptorSets(p->dev, &dsai, &p->dset), "vkAllocateDescriptorSets");
 
-    VkDescriptorBufferInfo dbi = { .buffer = p->ubo, .offset = 0, .range = sizeof(struct slang_ubo) };
-    VkDescriptorImageInfo  dii = {
-        .sampler = p->in_sampler, .imageView = p->in_view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    VkWriteDescriptorSet writes[2] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = p->dset,
-          .dstBinding = 0, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          .pBufferInfo = &dbi },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = p->dset,
-          .dstBinding = 2, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          .pImageInfo = &dii },
-    };
-    vkUpdateDescriptorSets(p->dev, 2, writes, 0, NULL);
+    /* Compile each pass's shader and build its pipeline. */
+    uint32_t prev_w = input_w, prev_h = input_h;
+    VkImageView prev_view    = p->in_view;
+    VkSampler   prev_sampler = p->in_sampler;
+    for (size_t i = 0; i < n_passes; ++i) {
+        struct pass_state *ps = &p->passes[i];
+        const struct slangp_pass *ppass = (preset && preset->num_passes > 0)
+                                          ? &preset->passes[i] : NULL;
+
+        /* Compile this pass's shader (or built-in for the empty preset). */
+        char *cerr = NULL;
+        if (ppass && ppass->path) {
+            ps->mod = slang_compile_file(ppass->path, &cerr);
+        } else {
+            ps->mod = slang_compile_string(BUILTIN_SLANG, NULL, &cerr);
+        }
+        if (!ps->mod) {
+            if (err_out) *err_out = err_fmt("compiling pass %zu (%s) failed: %s",
+                                            i, (ppass && ppass->path) ? ppass->path : "<built-in>",
+                                            cerr ? cerr : "(unknown)");
+            free(cerr);
+            goto fail;
+        }
+
+        /* Resolve dims. The final pass is forced to output_w x output_h so
+         * the readback buffer matches. (The slangp `viewport` scale type
+         * usually achieves this naturally; we coerce as a safety net.) */
+        uint32_t pw, ph;
+        if (ppass) resolve_pass_dims(ppass, prev_w, prev_h, output_w, output_h, &pw, &ph);
+        else       { pw = output_w; ph = output_h; }
+        if (i == n_passes - 1) { pw = output_w; ph = output_h; }
+
+        if (build_pass(p, ps, ppass, pw, ph, prev_view, prev_sampler, err_out) != 0) goto fail;
+
+        prev_w = pw; prev_h = ph;
+        prev_view    = ps->out_view;
+        prev_sampler = ps->sampler;
+    }
 
     /* Command pool/buffer + fence. */
     VkCommandPoolCreateInfo cpci = {
@@ -693,8 +741,7 @@ static void barrier(VkCommandBuffer cmd, VkImage img,
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = src_a, .dstAccessMask = dst_a,
-        .oldLayout = from, .newLayout = to,
-        .image = img,
+        .oldLayout = from, .newLayout = to, .image = img,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -706,24 +753,18 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
 {
     if (!p || !src || !dst) return -1;
 
-    /* 1. Upload. */
+    /* 1. Upload input. */
     size_t ubytes = (size_t)p->input_w * p->input_h * 4;
     memcpy(p->stg_upload_ptr, src, ubytes);
 
-    /* 2. Build the push constant block. */
+    /* 2. Push constants block (same SourceSize/OutputSize/FrameCount applied
+     *    to all passes for now; per-pass dim-specific values are populated
+     *    lazily inside the loop). */
     struct slang_push pc = {0};
-    pc.source_size  [0] = (float)p->input_w;
-    pc.source_size  [1] = (float)p->input_h;
-    pc.source_size  [2] = 1.0f / (float)p->input_w;
-    pc.source_size  [3] = 1.0f / (float)p->input_h;
-    pc.original_size[0] = pc.source_size[0];
-    pc.original_size[1] = pc.source_size[1];
-    pc.original_size[2] = pc.source_size[2];
-    pc.original_size[3] = pc.source_size[3];
-    pc.output_size  [0] = (float)p->output_w;
-    pc.output_size  [1] = (float)p->output_h;
-    pc.output_size  [2] = 1.0f / (float)p->output_w;
-    pc.output_size  [3] = 1.0f / (float)p->output_h;
+    pc.original_size[0] = (float)p->input_w;
+    pc.original_size[1] = (float)p->input_h;
+    pc.original_size[2] = 1.0f / (float)p->input_w;
+    pc.original_size[3] = 1.0f / (float)p->input_h;
     pc.frame_count      = p->frame_count++;
 
     /* 3. Record + submit. */
@@ -734,6 +775,7 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     };
     if (vkBeginCommandBuffer(p->cmd, &cbbi) != VK_SUCCESS) return -2;
 
+    /* Upload to in_img. */
     barrier(p->cmd, p->in_img,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -749,36 +791,61 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    VkClearValue clear = { .color = { .float32 = { 0, 0, 0, 1 } } };
-    VkRenderPassBeginInfo rpbi = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = p->render_pass, .framebuffer = p->framebuffer,
-        .renderArea = { {0,0}, { p->output_w, p->output_h } },
-        .clearValueCount = 1, .pClearValues = &clear,
-    };
-    vkCmdBeginRenderPass(p->cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipeline);
-    vkCmdBindDescriptorSets(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            p->pipe_layout, 0, 1, &p->dset, 0, NULL);
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(p->cmd, 0, 1, &p->vbuf, &off);
-    vkCmdBindIndexBuffer(p->cmd, p->ibuf, 0, VK_INDEX_TYPE_UINT16);
-    vkCmdPushConstants(p->cmd, p->pipe_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof(pc), &pc);
-    vkCmdDrawIndexed(p->cmd, 6, 1, 0, 0, 0);
-    vkCmdEndRenderPass(p->cmd);
+    /* Iterate passes. */
+    uint32_t prev_w = p->input_w, prev_h = p->input_h;
+    for (size_t i = 0; i < p->num_passes; ++i) {
+        struct pass_state *ps = &p->passes[i];
 
+        /* Per-pass push constants. */
+        pc.source_size[0] = (float)prev_w; pc.source_size[1] = (float)prev_h;
+        pc.source_size[2] = 1.0f / (float)prev_w;
+        pc.source_size[3] = 1.0f / (float)prev_h;
+        pc.output_size[0] = (float)ps->out_w; pc.output_size[1] = (float)ps->out_h;
+        pc.output_size[2] = 1.0f / (float)ps->out_w;
+        pc.output_size[3] = 1.0f / (float)ps->out_h;
+
+        VkClearValue clear = { .color = { .float32 = { 0, 0, 0, 1 } } };
+        VkRenderPassBeginInfo rpbi = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = ps->render_pass, .framebuffer = ps->framebuffer,
+            .renderArea = { {0,0}, { ps->out_w, ps->out_h } },
+            .clearValueCount = 1, .pClearValues = &clear,
+        };
+        vkCmdBeginRenderPass(p->cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ps->pipeline);
+        vkCmdBindDescriptorSets(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                ps->pipe_layout, 0, 1, &ps->dset, 0, NULL);
+        VkDeviceSize off = 0;
+        vkCmdBindVertexBuffers(p->cmd, 0, 1, &p->vbuf, &off);
+        vkCmdBindIndexBuffer(p->cmd, ps->framebuffer ? p->ibuf : p->ibuf, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdPushConstants(p->cmd, ps->pipe_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDrawIndexed(p->cmd, 6, 1, 0, 0, 0);
+        vkCmdEndRenderPass(p->cmd);
+
+        /* Render pass leaves out_img in SHADER_READ_ONLY (next pass's
+         * Source binding can sample from it directly). */
+        prev_w = ps->out_w; prev_h = ps->out_h;
+    }
+
+    /* Last pass output: SHADER_READ_ONLY -> TRANSFER_SRC, copy, restore. */
+    struct pass_state *last = &p->passes[p->num_passes - 1];
+    barrier(p->cmd, last->out_img,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     VkBufferImageCopy bic2 = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { p->output_w, p->output_h, 1 },
+        .imageExtent = { last->out_w, last->out_h, 1 },
     };
-    vkCmdCopyImageToBuffer(p->cmd, p->out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImageToBuffer(p->cmd, last->out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            p->stg_readback, 1, &bic2);
-    barrier(p->cmd, p->out_img,
+    barrier(p->cmd, last->out_img,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_UNDEFINED,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             VK_ACCESS_TRANSFER_READ_BIT, 0);
+
     if (vkEndCommandBuffer(p->cmd) != VK_SUCCESS) return -3;
 
     VkSubmitInfo si = {
@@ -799,6 +866,21 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
 /* Teardown                                                                   */
 /* -------------------------------------------------------------------------- */
 
+static void destroy_pass(VkDevice dev, struct pass_state *ps)
+{
+    if (ps->pipeline)     vkDestroyPipeline(dev, ps->pipeline, NULL);
+    if (ps->pipe_layout)  vkDestroyPipelineLayout(dev, ps->pipe_layout, NULL);
+    if (ps->dset_layout)  vkDestroyDescriptorSetLayout(dev, ps->dset_layout, NULL);
+    if (ps->framebuffer)  vkDestroyFramebuffer(dev, ps->framebuffer, NULL);
+    if (ps->render_pass)  vkDestroyRenderPass(dev, ps->render_pass, NULL);
+    if (ps->sampler)      vkDestroySampler(dev, ps->sampler, NULL);
+    if (ps->out_view)     vkDestroyImageView(dev, ps->out_view, NULL);
+    if (ps->out_img)      vkDestroyImage(dev, ps->out_img, NULL);
+    if (ps->out_mem)      vkFreeMemory(dev, ps->out_mem, NULL);
+    slang_module_free(ps->mod);
+    /* dset is freed when descriptor pool is destroyed */
+}
+
 void slang_pipeline_destroy(struct slang_pipeline *p)
 {
     if (!p) return;
@@ -806,12 +888,13 @@ void slang_pipeline_destroy(struct slang_pipeline *p)
 
     if (p->fence)        vkDestroyFence(p->dev, p->fence, NULL);
     if (p->cmd_pool)     vkDestroyCommandPool(p->dev, p->cmd_pool, NULL);
+
+    if (p->passes) {
+        for (size_t i = 0; i < p->num_passes; ++i) destroy_pass(p->dev, &p->passes[i]);
+        free(p->passes);
+    }
+
     if (p->dpool)        vkDestroyDescriptorPool(p->dev, p->dpool, NULL);
-    if (p->pipeline)     vkDestroyPipeline(p->dev, p->pipeline, NULL);
-    if (p->pipe_layout)  vkDestroyPipelineLayout(p->dev, p->pipe_layout, NULL);
-    if (p->dset_layout)  vkDestroyDescriptorSetLayout(p->dev, p->dset_layout, NULL);
-    if (p->framebuffer)  vkDestroyFramebuffer(p->dev, p->framebuffer, NULL);
-    if (p->render_pass)  vkDestroyRenderPass(p->dev, p->render_pass, NULL);
 
     if (p->ubo_mem)          { vkUnmapMemory(p->dev, p->ubo_mem); vkFreeMemory(p->dev, p->ubo_mem, NULL); }
     if (p->stg_upload_mem)   { vkUnmapMemory(p->dev, p->stg_upload_mem);   vkFreeMemory(p->dev, p->stg_upload_mem, NULL); }
@@ -827,15 +910,11 @@ void slang_pipeline_destroy(struct slang_pipeline *p)
 
     if (p->in_sampler)   vkDestroySampler(p->dev, p->in_sampler, NULL);
     if (p->in_view)      vkDestroyImageView(p->dev, p->in_view, NULL);
-    if (p->out_view)     vkDestroyImageView(p->dev, p->out_view, NULL);
     if (p->in_img)       vkDestroyImage(p->dev, p->in_img, NULL);
-    if (p->out_img)      vkDestroyImage(p->dev, p->out_img, NULL);
     if (p->in_mem)       vkFreeMemory(p->dev, p->in_mem, NULL);
-    if (p->out_mem)      vkFreeMemory(p->dev, p->out_mem, NULL);
 
     if (p->dev)          vkDestroyDevice(p->dev, NULL);
     if (p->instance)     vkDestroyInstance(p->instance, NULL);
 
-    slang_module_free(p->mod);
     free(p);
 }

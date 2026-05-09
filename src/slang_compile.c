@@ -307,6 +307,101 @@ static int preprocess(const char *src, size_t src_len,
 }
 
 /* -------------------------------------------------------------------------- */
+/* shaderc include callbacks                                                  */
+/* -------------------------------------------------------------------------- */
+
+struct include_ctx {
+    char *base_dir;     /* dir of the slang file (or fallback) */
+};
+
+static char *include_dirname(const char *path)
+{
+    if (!path) return xstrdup(".");
+    const char *last = NULL;
+    for (const char *p = path; *p; ++p)
+        if (*p == '/' || *p == '\\') last = p;
+    if (!last) return xstrdup(".");
+    return xstrdup_n(path, (size_t)(last - path));
+}
+
+static char *include_join(const char *dir, const char *name)
+{
+    if (!dir || !*dir) dir = ".";
+    size_t need = strlen(dir) + 1 + strlen(name) + 1;
+    char *out = (char *)malloc(need);
+    if (!out) return NULL;
+    snprintf(out, need, "%s/%s", dir, name);
+    return out;
+}
+
+static char *include_slurp(const char *path, size_t *size_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { *size_out = 0; return NULL; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz < 0) { fclose(f); *size_out = 0; return NULL; }
+    char *buf = (char *)malloc((size_t)sz);
+    if (!buf) { fclose(f); *size_out = 0; return NULL; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    *size_out = got;
+    return buf;
+}
+
+static shaderc_include_result *include_resolve(
+    void *user_data, const char *requested, int type,
+    const char *requesting, size_t include_depth)
+{
+    (void)type; (void)include_depth;
+    struct include_ctx *ctx = (struct include_ctx *)user_data;
+
+    /* Resolve directory: prefer the requesting file's dir, else base. */
+    char *dir = NULL;
+    if (requesting && *requesting && (strchr(requesting, '/') || strchr(requesting, '\\'))) {
+        dir = include_dirname(requesting);
+    } else if (ctx && ctx->base_dir) {
+        dir = xstrdup(ctx->base_dir);
+    } else {
+        dir = xstrdup(".");
+    }
+    char *full = include_join(dir, requested);
+    free(dir);
+
+    size_t sz = 0;
+    char  *data = include_slurp(full, &sz);
+
+    shaderc_include_result *r = (shaderc_include_result *)calloc(1, sizeof(*r));
+    if (data) {
+        r->source_name        = full;
+        r->source_name_length = strlen(full);
+        r->content            = data;
+        r->content_length     = sz;
+        r->user_data          = NULL;
+    } else {
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "could not open '%s'", full);
+        r->source_name        = (char *)"";
+        r->source_name_length = 0;
+        r->content            = xstrdup(msg);
+        r->content_length     = strlen(msg);
+        r->user_data          = full;  /* freed in release */
+    }
+    return r;
+}
+
+static void include_release(void *user_data, shaderc_include_result *r)
+{
+    (void)user_data;
+    if (!r) return;
+    if (r->user_data) free(r->user_data);    /* the failed-path string */
+    if (r->source_name && *r->source_name) free((void *)r->source_name);
+    if (r->content) free((void *)r->content);
+    free(r);
+}
+
+/* -------------------------------------------------------------------------- */
 /* shaderc invocation                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -364,11 +459,16 @@ static int compile_stage(shaderc_compiler_t compiler,
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
-struct slang_module *slang_compile_string(const char *src,
-                                          const char *include_dir,
-                                          char **err_out)
+/* Internal entry point that does the actual compile. include_dir is the
+ * directory used to resolve relative #include directives; src_path is the
+ * file path passed through to shaderc as the diagnostic name AND as the
+ * "requesting" source for the first include (so #include "../foo.h" works
+ * from a shader buried in a subdirectory). */
+static struct slang_module *compile_internal(const char *src,
+                                             const char *include_dir,
+                                             const char *src_path,
+                                             char **err_out)
 {
-    (void)include_dir;  /* #include resolution is Phase 9 work */
     if (!src) { if (err_out) *err_out = xstrdup("null source"); return NULL; }
 
     struct slang_module *mod = (struct slang_module *)calloc(1, sizeof(*mod));
@@ -396,15 +496,28 @@ struct slang_module *slang_compile_string(const char *src,
     shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_5);
     shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
 
+    /* #include resolution. base_dir falls back through (a) explicit
+     * include_dir param, (b) the slang file's parent dir, (c) "."" */
+    struct include_ctx inc_ctx = { 0 };
+    if (include_dir && *include_dir)
+        inc_ctx.base_dir = xstrdup(include_dir);
+    else if (src_path)
+        inc_ctx.base_dir = include_dirname(src_path);
+    else
+        inc_ctx.base_dir = xstrdup(".");
+    shaderc_compile_options_set_include_callbacks(options, include_resolve,
+                                                  include_release, &inc_ctx);
+
     int rc = compile_stage(compiler, options, shaderc_glsl_vertex_shader,
-                           vert.data, vert.n, NULL,
+                           vert.data, vert.n, src_path,
                            &mod->vert_spv, &mod->vert_spv_words, err_out);
     if (rc == 0) {
         rc = compile_stage(compiler, options, shaderc_glsl_fragment_shader,
-                           frag.data, frag.n, NULL,
+                           frag.data, frag.n, src_path,
                            &mod->frag_spv, &mod->frag_spv_words, err_out);
     }
 
+    free(inc_ctx.base_dir);
     shaderc_compile_options_release(options);
     shaderc_compiler_release(compiler);
     free(vert.data);
@@ -415,6 +528,13 @@ struct slang_module *slang_compile_string(const char *src,
         return NULL;
     }
     return mod;
+}
+
+struct slang_module *slang_compile_string(const char *src,
+                                          const char *include_dir,
+                                          char **err_out)
+{
+    return compile_internal(src, include_dir, NULL, err_out);
 }
 
 struct slang_module *slang_compile_file(const char *path, char **err_out)
@@ -433,7 +553,7 @@ struct slang_module *slang_compile_file(const char *path, char **err_out)
     fclose(f);
     buf[sz] = '\0';
 
-    struct slang_module *m = slang_compile_string(buf, NULL, err_out);
+    struct slang_module *m = compile_internal(buf, NULL, path, err_out);
     free(buf);
     if (m) m->path = xstrdup(path);
     return m;
