@@ -15,6 +15,30 @@ audio reactivity, and GPU zero-copy / hardware decode.
 It mirrors the phase style of [the build roadmap](roadmap.html): each phase is
 a mergeable chunk that ends with a demo and a test.
 
+## Progress (realtime-streaming branch)
+
+- **R0 — done & verified.** Per-frame metrics (`SLANGFX_METRICS=1`) + an
+  out-of-tree latency/throughput harness. Baseline at 720p was **49 fps / 21 ms
+  RTT**, and the in-binary metrics localised the entire cost to the render
+  stage (read+write were sub-millisecond).
+- **Readback perf fix — done & verified (headline result).** The render cost
+  was an uncached-readback bug: the staging buffer was `HOST_COHERENT`
+  (write-combined) and the per-frame `memcpy` *read* from it at ~175 MiB/s.
+  Switching to `HOST_CACHED` (+ invalidate) dropped render **20.1 ms → 1.17 ms
+  (17×)**, taking 720p from 49 fps to **395 fps** end-to-end, output
+  byte-identical. *This reframes the plan:* the serial loop was never the
+  bottleneck, so **HD is now realtime-capable on the existing path**; the
+  remaining work is live sources/sinks and 4K/zero-copy, not the core loop.
+- **R1 — done & verified.** `frame_source` / `frame_sink` interfaces; the
+  stdin/stdout path is now the `stdio_*` implementation; byte-identical batch
+  output.
+- **R2 (time base) — done & verified.** Wall-clock `Time` standard field
+  threaded through `slang_pipeline_run`; PTS-driven when a source supplies it,
+  internal wall clock otherwise. Verified advancing at 1.0/sec.
+- **R2 (threading/device-pipelining), R3–R8 — designed, not yet built.** These
+  require a window / audio device / hwaccel interop that the headless build/CI
+  cannot exercise; they remain as specified below.
+
 ## The four things that block realtime
 
 1. **Blocking serial loop** (`src/main.c`): one frame fully in flight at a
