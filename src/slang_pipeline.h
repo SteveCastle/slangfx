@@ -46,9 +46,14 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
  * BGRA8 / RGBA8 (Phase 1); Phase 9 adds zero-copy Vulkan AVFrame paths.
  *
  * `src` length must be input_w * input_h * 4 bytes.
- * `dst` length must be output_w * output_h * 4 bytes. */
+ * `dst` length must be output_w * output_h * 4 bytes.
+ *
+ * `time_sec` populates the `Time` standard field (seconds). Pass a real frame
+ * timestamp (PTS) so time-based effects stay correct under realtime pacing and
+ * dropped frames; pass a negative value to use an internal wall clock measured
+ * from the first frame. */
 int slang_pipeline_run(struct slang_pipeline *p,
-                       const uint8_t *src, uint8_t *dst);
+                       const uint8_t *src, uint8_t *dst, double time_sec);
 
 void slang_pipeline_destroy(struct slang_pipeline *p);
 

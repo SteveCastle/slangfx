@@ -29,6 +29,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "slang_pipeline.h"
 #include "slang_compile.h"
+#include "slang_metrics.h"   /* slang_now_ms() for the Time wall-clock fallback */
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -229,6 +230,11 @@ struct slang_pipeline {
     size_t num_aliases;
 
     uint32_t frame_count;
+
+    /* Wall-clock baseline for the `Time` standard field, used when the caller
+     * does not supply a frame timestamp (realtime sinks pass real PTS). */
+    double   clock_start_ms;
+    bool     clock_started;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1413,9 +1419,21 @@ static void generate_mipmaps(VkCommandBuffer cmd, VkImage img,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
 }
 
-int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst)
+int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst,
+                       double time_sec)
 {
     if (!p || !src || !dst) return -1;
+
+    /* Resolve the `Time` standard field (seconds). A realtime source supplies
+     * a real timestamp (PTS) so time-based effects stay correct under pacing
+     * and dropped frames; when it is unknown (time_sec < 0, e.g. the untimed
+     * stdio source) we fall back to a wall clock from the first frame. */
+    if (time_sec < 0.0) {
+        double now = slang_now_ms();
+        if (!p->clock_started) { p->clock_start_ms = now; p->clock_started = true; }
+        time_sec = (now - p->clock_start_ms) / 1000.0;
+    }
+    float time_val = (float)time_sec;
 
     /* 1. Upload input. */
     size_t ubytes = (size_t)p->input_w * p->input_h * 4;
@@ -1555,6 +1573,9 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             WRITE_FIELD(push_blob, sizeof(push_blob),
                         ps->mod->push_fields, ps->mod->num_push_fields, true,
                         "Rotation",           &rot,              4);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "Time",               &time_val,         4);
 
             /* Populate UBO with the same standard fields if the shader
              * declared them there. */
@@ -1580,6 +1601,9 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             WRITE_FIELD(ubo, ps->ubo_size,
                         ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
                         "Rotation",           &rot,              4);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "Time",               &time_val,         4);
 
             /* Aliased / numbered / feedback `<TexName>Size` fields: the
              * libretro slang spec lets shaders declare a vec4 size for any

@@ -152,7 +152,7 @@ int main(int argc, char **argv)
         if (got < 0) break;                              /* source diagnosed it */
 
         double t1 = metrics ? slang_now_ms() : 0.0;
-        rc = slang_pipeline_run(pipeline, in.data, frame_out);
+        rc = slang_pipeline_run(pipeline, in.data, frame_out, in.pts);
         if (rc != 0) {
             fprintf(stderr, "slangfx: pipeline run failed at frame %llu (rc=%d)\n",
                     frames, rc);
