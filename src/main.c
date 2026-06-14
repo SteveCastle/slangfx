@@ -35,6 +35,7 @@
 #include "slangp.h"
 #include "slang_pipeline.h"
 #include "slang_metrics.h"
+#include "frame_io.h"
 
 struct args {
     const char *preset_path;
@@ -126,11 +127,15 @@ int main(int argc, char **argv)
     }
 
     const size_t frame_bytes = (size_t)args.width * (size_t)args.height * 4;
-    unsigned char *frame_in  = malloc(frame_bytes);
     unsigned char *frame_out = malloc(frame_bytes);
-    if (!frame_in || !frame_out) {
-        fprintf(stderr, "slangfx: out of memory\n");
-        free(frame_in); free(frame_out);
+    struct frame_source *source = stdio_source_create(frame_bytes, &err);
+    struct frame_sink   *sink   = NULL;
+    if (frame_out && source) sink = stdio_sink_create(frame_bytes, &err);
+    if (!frame_out || !source || !sink) {
+        fprintf(stderr, "slangfx: IO init failed: %s\n", err ? err : "out of memory");
+        free(err); free(frame_out);
+        if (source) source->destroy(source);
+        if (sink) sink->destroy(sink);
         slang_pipeline_destroy(pipeline);
         slangp_free(preset);
         return 5;
@@ -139,18 +144,15 @@ int main(int argc, char **argv)
     struct slang_metrics *metrics = slang_metrics_create();   /* NULL if disabled */
 
     unsigned long long frames = 0;
+    struct frame in;
     while (1) {
         double t0 = metrics ? slang_now_ms() : 0.0;
-        size_t got = fread(frame_in, 1, frame_bytes, stdin);
-        if (got == 0) break;                             /* clean EOF */
-        if (got != frame_bytes) {
-            fprintf(stderr, "slangfx: short read at frame %llu (%zu / %zu bytes)\n",
-                    frames, got, frame_bytes);
-            break;
-        }
+        int got = source->next(source, &in);
+        if (got == 0) break;                             /* clean EOS */
+        if (got < 0) break;                              /* source diagnosed it */
 
         double t1 = metrics ? slang_now_ms() : 0.0;
-        rc = slang_pipeline_run(pipeline, frame_in, frame_out);
+        rc = slang_pipeline_run(pipeline, in.data, frame_out);
         if (rc != 0) {
             fprintf(stderr, "slangfx: pipeline run failed at frame %llu (rc=%d)\n",
                     frames, rc);
@@ -158,24 +160,20 @@ int main(int argc, char **argv)
         }
 
         double t2 = metrics ? slang_now_ms() : 0.0;
-        size_t wrote = fwrite(frame_out, 1, frame_bytes, stdout);
-        if (wrote != frame_bytes) {
-            fprintf(stderr, "slangfx: short write at frame %llu (%zu / %zu bytes)\n",
-                    frames, wrote, frame_bytes);
-            break;
-        }
+        if (sink->put(sink, frame_out, frame_bytes, in.pts) != 0)
+            break;                                       /* sink diagnosed it */
 
         if (metrics)
             slang_metrics_record(metrics, t1 - t0, t2 - t1, slang_now_ms() - t2);
 
         ++frames;
     }
-    fflush(stdout);
 
     slang_metrics_report(metrics);
     slang_metrics_destroy(metrics);
 
-    free(frame_in);
+    source->destroy(source);
+    sink->destroy(sink);
     free(frame_out);
     slang_pipeline_destroy(pipeline);
     slangp_free(preset);

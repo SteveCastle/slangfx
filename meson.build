@@ -81,6 +81,7 @@ slangfx_sources = files(
   'src/slang_pipeline.c',
   'src/spv_reflect.c',
   'src/slang_metrics.c',
+  'src/frame_io.c',
 )
 
 slangfx_inc = include_directories('src')
