@@ -34,6 +34,7 @@
 
 #include "slangp.h"
 #include "slang_pipeline.h"
+#include "slang_metrics.h"
 
 struct args {
     const char *preset_path;
@@ -135,8 +136,11 @@ int main(int argc, char **argv)
         return 5;
     }
 
+    struct slang_metrics *metrics = slang_metrics_create();   /* NULL if disabled */
+
     unsigned long long frames = 0;
     while (1) {
+        double t0 = metrics ? slang_now_ms() : 0.0;
         size_t got = fread(frame_in, 1, frame_bytes, stdin);
         if (got == 0) break;                             /* clean EOF */
         if (got != frame_bytes) {
@@ -145,6 +149,7 @@ int main(int argc, char **argv)
             break;
         }
 
+        double t1 = metrics ? slang_now_ms() : 0.0;
         rc = slang_pipeline_run(pipeline, frame_in, frame_out);
         if (rc != 0) {
             fprintf(stderr, "slangfx: pipeline run failed at frame %llu (rc=%d)\n",
@@ -152,6 +157,7 @@ int main(int argc, char **argv)
             break;
         }
 
+        double t2 = metrics ? slang_now_ms() : 0.0;
         size_t wrote = fwrite(frame_out, 1, frame_bytes, stdout);
         if (wrote != frame_bytes) {
             fprintf(stderr, "slangfx: short write at frame %llu (%zu / %zu bytes)\n",
@@ -159,9 +165,15 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (metrics)
+            slang_metrics_record(metrics, t1 - t0, t2 - t1, slang_now_ms() - t2);
+
         ++frames;
     }
     fflush(stdout);
+
+    slang_metrics_report(metrics);
+    slang_metrics_destroy(metrics);
 
     free(frame_in);
     free(frame_out);
