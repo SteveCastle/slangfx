@@ -191,6 +191,7 @@ struct slang_pipeline {
     VkBuffer       stg_readback;
     VkDeviceMemory stg_readback_mem;
     void          *stg_readback_ptr;
+    bool           stg_readback_coherent;  /* false => invalidate before read */
 
     /* Shared resources */
     VkBuffer       vbuf;
@@ -357,6 +358,47 @@ static int create_buffer(struct slang_pipeline *p, VkDeviceSize size,
     VK_CHECK(vkBindBufferMemory(p->dev, *buf_out, *mem_out, 0), "vkBindBufferMemory");
     if (mapped_out)
         VK_CHECK(vkMapMemory(p->dev, *mem_out, 0, size, 0, mapped_out), "vkMapMemory");
+    return 0;
+fail: return -1;
+}
+
+/* Readback staging buffer. Prefers HOST_CACHED memory: the readback path
+ * memcpy's *out* of this buffer every frame, and CPU reads from the usual
+ * HOST_COHERENT (write-combined) memory are pathologically slow — at 720p
+ * that single uncached read dominated frame time (~175 MiB/s ceiling). Cached
+ * host memory makes the read fast; we then invalidate it before each read so
+ * the CPU sees the GPU's writes (a no-op when the type also happens to be
+ * coherent). Falls back to COHERENT when no cached type is available. */
+static int create_readback_buffer(struct slang_pipeline *p, VkDeviceSize size,
+                                  char **err_out)
+{
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VK_CHECK(vkCreateBuffer(p->dev, &bci, NULL, &p->stg_readback), "vkCreateBuffer(readback)");
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(p->dev, p->stg_readback, &mr);
+
+    uint32_t mt = find_memtype(&p->mem_props, mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (mt == UINT32_MAX)
+        mt = find_memtype(&p->mem_props, mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) {
+        if (err_out) *err_out = xstrdup("no host-visible readback memory");
+        goto fail;
+    }
+    p->stg_readback_coherent =
+        (p->mem_props.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size, .memoryTypeIndex = mt,
+    };
+    VK_CHECK(vkAllocateMemory(p->dev, &mai, NULL, &p->stg_readback_mem), "vkAllocateMemory(readback)");
+    VK_CHECK(vkBindBufferMemory(p->dev, p->stg_readback, p->stg_readback_mem, 0), "vkBindBufferMemory(readback)");
+    VK_CHECK(vkMapMemory(p->dev, p->stg_readback_mem, 0, size, 0, &p->stg_readback_ptr), "vkMapMemory(readback)");
     return 0;
 fail: return -1;
 }
@@ -1039,9 +1081,7 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     if (create_buffer(p, ubytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->stg_upload, &p->stg_upload_mem, &p->stg_upload_ptr, err_out) != 0) goto fail;
-    if (create_buffer(p, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      &p->stg_readback, &p->stg_readback_mem, &p->stg_readback_ptr, err_out) != 0) goto fail;
+    if (create_readback_buffer(p, rbytes, err_out) != 0) goto fail;
 
     if (create_buffer(p, sizeof(QUAD_VERTS), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1713,8 +1753,16 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     if (vkQueueSubmit(p->queue, 1, &si, p->fence) != VK_SUCCESS) return -4;
     vkWaitForFences(p->dev, 1, &p->fence, VK_TRUE, UINT64_MAX);
 
-    /* 4. Read back. */
+    /* 4. Read back. Cached readback memory needs an invalidate so the CPU
+     * sees the GPU's just-written bytes (no-op when the type is coherent). */
     size_t rbytes = (size_t)p->output_w * p->output_h * 4;
+    if (!p->stg_readback_coherent) {
+        VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = p->stg_readback_mem, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        vkInvalidateMappedMemoryRanges(p->dev, 1, &range);
+    }
     memcpy(dst, p->stg_readback_ptr, rbytes);
     return 0;
 }
