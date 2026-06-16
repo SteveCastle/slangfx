@@ -7,7 +7,8 @@ one slider per `#pragma parameter`. Dragging a slider sends a live
 with no pipeline rebuild. The menu bar switches shader or video on the fly
 (the ffmpeg|slangfx pair is restarted and the sliders rebuilt). Tuned a look
 you like? "Copy params" gives the `k=v,k=v` string for `slangfx --params` /
-`beat_cut --shader-params`.
+`beat_cut --shader-params`, or "Export" renders the current look to an H.264
+file at the source's native resolution/fps with the original audio copied.
 
 Pipeline:  ffmpeg (decode+loop+letterbox) -> slangfx (--control-port) -> app
 Controls:  app -> UDP name=value -> slangfx
@@ -267,6 +268,56 @@ def make_pipeline(args, video, preset, w, h, port, params, realtime=True):
                     w, h, args.fps, port, params, realtime=realtime)
 
 
+def parse_params_str(s):
+    """'a=1,b=2' -> {'a': 1.0, 'b': 2.0}; tolerant of spaces/empties."""
+    out = {}
+    for tok in (s or "").replace(";", ",").replace("\n", ",").split(","):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            try:
+                out[k.strip()] = float(v)
+            except ValueError:
+                pass
+    return out
+
+
+# --------------------------------------------------------------------------
+# Export — full-resolution render to H.264 with the original audio.
+# --------------------------------------------------------------------------
+def export_video(args, video, preset, params_str, out_path):
+    """Render `video` through `preset` (with `params_str`) to an H.264 file at
+    the source's native resolution/fps, copying the original audio. Reuses
+    wrappers/slangfx.py for the shaded path; a plain libx264 transcode when no
+    preset is loaded. Blocking; returns (ok, message)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if preset:
+        cmd = [sys.executable, os.path.join(here, "slangfx.py"),
+               "-i", video, "-o", out_path, "--preset", preset,
+               "--slangfx", args.slangfx, "--ffmpeg", args.ffmpeg]
+        if params_str:
+            cmd += ["--params", params_str]
+    else:
+        # No shader: straight H.264 transcode, copy audio, keep res/fps.
+        cmd = [args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", video, "-map", "0:v:0", "-map", "0:a?",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+               "-pix_fmt", "yuv420p", "-c:a", "copy", out_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as e:
+        return False, f"export error: {e}"
+    if r.returncode == 0 and os.path.isfile(out_path):
+        return True, f"exported -> {out_path}"
+    tail = (r.stderr or r.stdout or "").strip().splitlines()
+    return False, "export failed: " + (tail[-1] if tail else f"rc={r.returncode}")
+
+
+def default_export_path(video, preset):
+    base = os.path.splitext(video)[0]
+    tag = os.path.splitext(os.path.basename(preset))[0] if preset else "h264"
+    return f"{base}_{tag}.mp4"
+
+
 # --------------------------------------------------------------------------
 # GUI (Dear PyGui)
 # --------------------------------------------------------------------------
@@ -349,6 +400,48 @@ def run_gui(args, w, h, params):
     def set_blank():
         dpg.set_value("preview_tex", blank)
 
+    # --- export -----------------------------------------------------------
+    export_state = {"busy": False, "msg": None, "shown": None}
+
+    def current_params_string():
+        return ",".join(f"{p['name']}={dpg.get_value('sld_' + p['name']):g}"
+                        for p in state["params"])
+
+    def run_export(out_path):
+        if not state["video"]:
+            dpg.set_value("status", "load a video before exporting")
+            return
+        if export_state["busy"]:
+            dpg.set_value("status", "an export is already running")
+            return
+        video, preset = state["video"], state["preset"]
+        params_str = current_params_string()
+
+        def worker():
+            export_state["busy"] = True
+            export_state["msg"] = (f"exporting -> {os.path.basename(out_path)} "
+                                   "(full resolution; this can take a while)...")
+            ok, msg = export_video(args, video, preset, params_str, out_path)
+            export_state["msg"] = msg
+            export_state["busy"] = False
+            print(msg, flush=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_export_dialog():
+        if not state["video"]:
+            dpg.set_value("status", "load a video before exporting")
+            return
+        out = default_export_path(state["video"], state["preset"])
+        dpg.configure_item("dlg_export", default_path=os.path.dirname(out),
+                           default_filename=os.path.basename(out))
+        dpg.show_item("dlg_export")
+
+    def on_export_pick(sender, app_data):
+        f = app_data.get("file_path_name")
+        if f:
+            run_export(f)
+
     # --- switching --------------------------------------------------------
     def start(video=_UNSET, preset=_UNSET):
         """(Re)build the pipeline for the current video/preset. Either arg may
@@ -409,6 +502,11 @@ def run_gui(args, w, h, params):
                                ".mp4,.mov,.mkv,.webm,.avi,.m4v,.gif}",
                                color=(120, 255, 160))
         dpg.add_file_extension(".*")
+    with dpg.file_dialog(directory_selector=False, show=False, modal=True,
+                         callback=on_export_pick, tag="dlg_export",
+                         width=720, height=440):
+        dpg.add_file_extension(".mp4", color=(255, 210, 120))
+        dpg.add_file_extension(".*")
 
     # --- window + menu ----------------------------------------------------
     with dpg.window(tag="main"):
@@ -438,6 +536,14 @@ def run_gui(args, w, h, params):
                 dpg.add_menu_item(label="Copy params", callback=copy_params)
                 dpg.add_menu_item(label="Reset to defaults", callback=reset_params)
                 dpg.add_menu_item(label="Pause / resume", callback=toggle_pause)
+            with dpg.menu(label="Export"):
+                dpg.add_menu_item(
+                    label="Export H.264 (next to source)",
+                    callback=lambda: run_export(
+                        default_export_path(state["video"], state["preset"])
+                        if state["video"] else ""))
+                dpg.add_menu_item(label="Export as...",
+                                  callback=open_export_dialog)
 
         with dpg.group(horizontal=True):
             dpg.add_image("preview_tex", width=w, height=h)
@@ -469,6 +575,10 @@ def run_gui(args, w, h, params):
                 dpg.set_value("preview_tex", arr)
             if not p.running and p.frames == 0:
                 dpg.set_value("status", "could not open source (check the file)")
+        # Surface export progress/result from the worker thread.
+        if export_state["msg"] and export_state["msg"] != export_state["shown"]:
+            dpg.set_value("status", export_state["msg"])
+            export_state["shown"] = export_state["msg"]
         dpg.render_dearpygui_frame()
 
     if state["pipe"]:
@@ -570,6 +680,13 @@ def main():
     ap.add_argument("--videos-dir", default=None,
                     help="Directory scanned to populate the Video menu "
                          "(default: the --input's folder, else cwd).")
+    ap.add_argument("--params", default=None,
+                    help="Initial 'k=v,k=v' param overrides (seed the sliders; "
+                         "also used by --export).")
+    ap.add_argument("--export", default=None, metavar="OUT",
+                    help="Headless: render --input through --preset (with "
+                         "--params) to an H.264 file (original audio + res/fps) "
+                         "and exit.")
     ap.add_argument("--width", type=int, default=0, help="Preview width (px).")
     ap.add_argument("--height", type=int, default=0, help="Preview height (px).")
     ap.add_argument("--fps", type=int, default=30, help="Preview frame rate.")
@@ -589,6 +706,23 @@ def main():
     params = discover_params(args.preset) if args.preset else []
     if args.preset and not params:
         sys.exit(f"no #pragma parameters found in {args.preset}")
+
+    # Seed slider defaults from --params so launch overrides are reflected.
+    if args.params and params:
+        ov = parse_params_str(args.params)
+        for p in params:
+            if p["name"] in ov:
+                p["default"] = ov[p["name"]]
+
+    if args.export:
+        if not args.input:
+            sys.exit("--export requires --input")
+        ok, msg = export_video(
+            args, os.path.abspath(args.input),
+            os.path.abspath(args.preset) if args.preset else None,
+            args.params, os.path.abspath(args.export))
+        print(msg)
+        sys.exit(0 if ok else 1)
 
     if args.selftest:
         if not args.input or not args.preset:
