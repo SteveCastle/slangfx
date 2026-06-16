@@ -6,6 +6,10 @@ builddir/
 # Generated SPIR-V (we ship sources, not artifacts)
 *.spv
 
+# Python wrapper caches
+__pycache__/
+*.pyc
+
 # Editor / IDE
 .vscode/
 .idea/

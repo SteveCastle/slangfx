@@ -21,6 +21,7 @@ python wrappers/slangfx.py \
 - **[Install]({{ '/install.html' | relative_url }})** — Vulkan SDK, ffmpeg, build from source on Windows / Linux / macOS.
 - **[Usage]({{ '/usage.html' | relative_url }})** — `slangfx` CLI, the Python wrapper, low-level pipe orchestration.
 - **[Tested shaders]({{ '/shaders.html' | relative_url }})** — what's known to work end-to-end, plus tuning notes.
+- **[Bundled effects]({{ '/effects.html' | relative_url }})** — slangfx's own effect library (`shaders/`): colour, edges, blur/bloom, motion, glitch.
 - **[Architecture]({{ '/architecture.html' | relative_url }})** — how the pieces fit together inside the binary.
 - **[Roadmap]({{ '/roadmap.html' | relative_url }})** — what's done, what's deferred, what's coming.
 - **[Slang format reference]({{ '/slang_format.html' | relative_url }})** — quick reference for the shader format we consume.

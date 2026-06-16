@@ -80,6 +80,8 @@ slangfx_sources = files(
   'src/slang_compile.c',
   'src/slang_pipeline.c',
   'src/spv_reflect.c',
+  'src/slang_metrics.c',
+  'src/frame_io.c',
 )
 
 slangfx_inc = include_directories('src')
@@ -89,6 +91,11 @@ slangfx_args = []
 if get_option('enable_gpu')
   slangfx_deps += [vulkan_dep, shaderc_dep]
   slangfx_args += ['-DSLANGFX_GPU=1']
+endif
+
+# Live control plane (--control-port) uses UDP sockets; Winsock on Windows.
+if host_sys == 'windows'
+  slangfx_deps += cc.find_library('ws2_32')
 endif
 
 # Standalone executable. Reads raw RGBA from stdin, writes raw RGBA to stdout.

@@ -29,6 +29,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "slang_pipeline.h"
 #include "slang_compile.h"
+#include "slang_metrics.h"   /* slang_now_ms() for the Time wall-clock fallback */
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -117,10 +118,19 @@ struct pass_state {
     /* The pass's framebuffer image (= this pass's output, = next pass's
      * Source). Always created with COLOR_ATTACHMENT + SAMPLED + TRANSFER_SRC
      * so it can serve all three roles (write target, sampled by next pass,
-     * copied to readback for the final pass). */
+     * copied to readback for the final pass).
+     *
+     * When a downstream pass declares `mipmap_input<n> = true`, the producer
+     * needs a full mip chain. `mip_levels` is then > 1, `out_view` covers
+     * the full chain (for downstream sampling), and `fbo_view` is a
+     * single-mip-0 view used as the framebuffer attachment (Vulkan rejects
+     * multi-level views as render targets). When mip_levels == 1 the two
+     * aliases the same handle. */
     VkImage        out_img;
     VkDeviceMemory out_mem;
-    VkImageView    out_view;
+    VkImageView    out_view;     /* sampled view: covers all mip levels */
+    VkImageView    fbo_view;     /* render-target view: mip 0 only */
+    uint32_t       mip_levels;
     VkSampler      sampler;
 
     /* Phase 6: PassFeedback. If any later pass references this pass's output
@@ -182,6 +192,7 @@ struct slang_pipeline {
     VkBuffer       stg_readback;
     VkDeviceMemory stg_readback_mem;
     void          *stg_readback_ptr;
+    bool           stg_readback_coherent;  /* false => invalidate before read */
 
     /* Shared resources */
     VkBuffer       vbuf;
@@ -219,6 +230,11 @@ struct slang_pipeline {
     size_t num_aliases;
 
     uint32_t frame_count;
+
+    /* Wall-clock baseline for the `Time` standard field, used when the caller
+     * does not supply a frame timestamp (realtime sinks pass real PTS). */
+    double   clock_start_ms;
+    bool     clock_started;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -299,13 +315,15 @@ fail: return -1;
 
 static int create_image(struct slang_pipeline *p, uint32_t w, uint32_t h,
                         VkFormat fmt, VkImageUsageFlags usage,
+                        uint32_t mip_levels,
                         VkImage *img_out, VkDeviceMemory *mem_out,
                         char **err_out)
 {
+    if (mip_levels == 0) mip_levels = 1;
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
-        .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .extent = { w, h, 1 }, .mipLevels = mip_levels, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -350,16 +368,64 @@ static int create_buffer(struct slang_pipeline *p, VkDeviceSize size,
 fail: return -1;
 }
 
-static VkImageView create_view(VkDevice d, VkImage img, VkFormat fmt)
+/* Readback staging buffer. Prefers HOST_CACHED memory: the readback path
+ * memcpy's *out* of this buffer every frame, and CPU reads from the usual
+ * HOST_COHERENT (write-combined) memory are pathologically slow — at 720p
+ * that single uncached read dominated frame time (~175 MiB/s ceiling). Cached
+ * host memory makes the read fast; we then invalidate it before each read so
+ * the CPU sees the GPU's writes (a no-op when the type also happens to be
+ * coherent). Falls back to COHERENT when no cached type is available. */
+static int create_readback_buffer(struct slang_pipeline *p, VkDeviceSize size,
+                                  char **err_out)
 {
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VK_CHECK(vkCreateBuffer(p->dev, &bci, NULL, &p->stg_readback), "vkCreateBuffer(readback)");
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(p->dev, p->stg_readback, &mr);
+
+    uint32_t mt = find_memtype(&p->mem_props, mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (mt == UINT32_MAX)
+        mt = find_memtype(&p->mem_props, mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) {
+        if (err_out) *err_out = xstrdup("no host-visible readback memory");
+        goto fail;
+    }
+    p->stg_readback_coherent =
+        (p->mem_props.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size, .memoryTypeIndex = mt,
+    };
+    VK_CHECK(vkAllocateMemory(p->dev, &mai, NULL, &p->stg_readback_mem), "vkAllocateMemory(readback)");
+    VK_CHECK(vkBindBufferMemory(p->dev, p->stg_readback, p->stg_readback_mem, 0), "vkBindBufferMemory(readback)");
+    VK_CHECK(vkMapMemory(p->dev, p->stg_readback_mem, 0, size, 0, &p->stg_readback_ptr), "vkMapMemory(readback)");
+    return 0;
+fail: return -1;
+}
+
+static VkImageView create_view_mip(VkDevice d, VkImage img, VkFormat fmt,
+                                   uint32_t base_mip, uint32_t mip_count)
+{
+    if (mip_count == 0) mip_count = 1;
     VkImageViewCreateInfo ivci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, base_mip, mip_count, 0, 1 },
     };
     VkImageView v = VK_NULL_HANDLE;
     vkCreateImageView(d, &ivci, NULL, &v);
     return v;
+}
+
+static VkImageView create_view(VkDevice d, VkImage img, VkFormat fmt)
+{
+    return create_view_mip(d, img, fmt, 0, 1);
 }
 
 static VkShaderModule create_shader(VkDevice d, const uint32_t *spv, size_t words)
@@ -457,6 +523,92 @@ struct resolved_binding {
     bool        is_feedback;
     int         feedback_pass;   /* producer pass index */
 };
+
+/* Map a `<TexName>Size` push/UBO field name to (w, h) of the texture
+ * `TexName` refers to. Handles aliases, `Pass<n>`, `PassFeedback<n>`,
+ * `<alias>Feedback`, and `OriginalHistory<n>`. Standard fields
+ * (SourceSize, OriginalSize, OutputSize, FinalViewportSize) are handled
+ * by the explicit per-frame writes; this helper returns false for those.
+ * Returns true and fills *w/h on match. */
+static bool lookup_size_field(struct slang_pipeline *p,
+                              const char *field_name,
+                              uint32_t *w_out, uint32_t *h_out)
+{
+    if (!field_name) return false;
+    size_t n = strlen(field_name);
+    if (n <= 4 || strcmp(field_name + n - 4, "Size") != 0) return false;
+
+    char base[256];
+    size_t bn = n - 4;
+    if (bn >= sizeof(base)) return false;
+    memcpy(base, field_name, bn); base[bn] = '\0';
+
+    /* Standard fields: handled by the caller's explicit WRITE_FIELDs. */
+    if (!strcmp(base, "Source") || !strcmp(base, "Original") ||
+        !strcmp(base, "Output") || !strcmp(base, "FinalViewport"))
+        return false;
+
+    /* OriginalHistory<n>: every depth shares the original input dims for
+     * now (Phase 9 will track per-depth dims if non-square scaling lands). */
+    if (startswith(base, "OriginalHistory")) {
+        *w_out = p->input_w; *h_out = p->input_h;
+        return true;
+    }
+    /* PassFeedback<n>Size: same dims as that producer's output. */
+    if (startswith(base, "PassFeedback")) {
+        const char *digits = base + strlen("PassFeedback");
+        if (*digits >= '0' && *digits <= '9') {
+            int idx = atoi(digits);
+            if (idx >= 0 && (size_t)idx < p->num_passes) {
+                *w_out = p->passes[idx].out_w;
+                *h_out = p->passes[idx].out_h;
+                return true;
+            }
+        }
+        return false;
+    }
+    /* Pass<n>Size: that pass's output dims. */
+    if (startswith(base, "Pass")) {
+        const char *digits = base + 4;
+        if (*digits >= '0' && *digits <= '9') {
+            int idx = atoi(digits);
+            if (idx >= 0 && (size_t)idx < p->num_passes) {
+                *w_out = p->passes[idx].out_w;
+                *h_out = p->passes[idx].out_h;
+                return true;
+            }
+            return false;
+        }
+        /* Falls through to alias lookup (e.g. an alias literally named "Pass*"). */
+    }
+    /* <alias>FeedbackSize. */
+    if (bn > 8 && strcmp(base + bn - 8, "Feedback") == 0) {
+        char alias[256];
+        size_t an = bn - 8;
+        if (an < sizeof(alias)) {
+            memcpy(alias, base, an); alias[an] = '\0';
+            for (size_t i = 0; i < p->num_aliases; ++i) {
+                if (p->aliases[i].name && strcmp(p->aliases[i].name, alias) == 0) {
+                    size_t pi = p->aliases[i].pass_idx;
+                    *w_out = p->passes[pi].out_w;
+                    *h_out = p->passes[pi].out_h;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    /* <alias>Size. */
+    for (size_t i = 0; i < p->num_aliases; ++i) {
+        if (p->aliases[i].name && strcmp(p->aliases[i].name, base) == 0) {
+            size_t pi = p->aliases[i].pass_idx;
+            *w_out = p->passes[pi].out_w;
+            *h_out = p->passes[pi].out_h;
+            return true;
+        }
+    }
+    return false;
+}
 
 /* Resolve a sampler name to a (view, sampler) pair, marking feedback if
  * applicable. `prev_view`/`prev_sampler` are the previous pass's output (or
@@ -576,32 +728,62 @@ static void resolve_pass_dims(const struct slangp_pass *ps,
     *h_out = (uint32_t)(fy + 0.5f);
 }
 
-/* Phase A: allocate the pass's output framebuffer image + its sampler. */
+/* Compute mipLevels for a w×h image: 1 + floor(log2(max(w, h))). */
+static uint32_t mip_levels_for(uint32_t w, uint32_t h)
+{
+    uint32_t m = w > h ? w : h;
+    uint32_t lvls = 1;
+    while (m > 1) { m >>= 1; ++lvls; }
+    return lvls;
+}
+
+/* Phase A: allocate the pass's output framebuffer image + its sampler.
+ * `mip_levels` > 1 means a downstream pass declared `mipmap_input = true`
+ * for this pass's output; the image gets a full mip chain (generated each
+ * frame after rendering via vkCmdBlitImage), the `out_view` covers the
+ * whole chain (for sampling), and `fbo_view` is a single-mip-0 view used
+ * as the framebuffer attachment. */
 static int alloc_pass_image(struct slang_pipeline *p, struct pass_state *ps,
                             const struct slangp_pass *ppass,
                             uint32_t out_w, uint32_t out_h,
-                            VkFormat format, char **err_out)
+                            VkFormat format, uint32_t mip_levels,
+                            char **err_out)
 {
+    if (mip_levels == 0) mip_levels = 1;
     ps->out_w = out_w;
     ps->out_h = out_h;
     ps->format = format;
+    ps->mip_levels = mip_levels;
     if (create_image(p, out_w, out_h, format,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT |
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                     mip_levels,
                      &ps->out_img, &ps->out_mem, err_out) != 0) goto fail;
-    ps->out_view = create_view(p->dev, ps->out_img, format);
+    ps->out_view = create_view_mip(p->dev, ps->out_img, format, 0, mip_levels);
     if (!ps->out_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (pass out)"); goto fail; }
+    if (mip_levels > 1) {
+        ps->fbo_view = create_view_mip(p->dev, ps->out_img, format, 0, 1);
+        if (!ps->fbo_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (fbo)"); goto fail; }
+    } else {
+        ps->fbo_view = ps->out_view;
+    }
 
+    /* maxLod = mip_levels lets shaders sample any LOD via textureLod. With
+     * only 1 level the clamp is harmless (Vulkan clamps to image's own
+     * maxLod). LINEAR mipmap mode interpolates between mips for shaders
+     * that request fractional LOD. */
     VkSamplerCreateInfo sci = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = (ppass && ppass->filter_linear) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .minFilter = (ppass && ppass->filter_linear) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
         .addressModeU = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
         .addressModeV = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
         .addressModeW = wrap_to_vk(ppass ? ppass->wrap_mode : SLANGP_WRAP_CLAMP_TO_EDGE),
+        .minLod = 0.0f,
+        .maxLod = (float)mip_levels,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         .unnormalizedCoordinates = VK_FALSE,
     };
@@ -623,6 +805,7 @@ static int alloc_feedback_image(struct slang_pipeline *p, struct pass_state *ps,
     VkFormat fmt = ps->format ? ps->format : VK_FORMAT_R8G8B8A8_UNORM;
     if (create_image(p, ps->out_w, ps->out_h, fmt,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                     1,
                      &ps->feedback_img, &ps->feedback_mem, err_out) != 0) return -1;
     ps->feedback_view = create_view(p->dev, ps->feedback_img, fmt);
     if (!ps->feedback_view) { if (err_out) *err_out = xstrdup("vkCreateImageView (feedback)"); return -1; }
@@ -668,10 +851,12 @@ static int build_pass_pipeline(struct slang_pipeline *p, struct pass_state *ps,
     VK_CHECK(vkCreateRenderPass(p->dev, &rpci, NULL, &ps->render_pass),
              "vkCreateRenderPass (pass)");
 
+    /* Framebuffer attaches the single-mip-0 view; multi-mip out_view is
+     * for sampling, not rendering. */
     VkFramebufferCreateInfo fbci = {
         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass = ps->render_pass,
-        .attachmentCount = 1, .pAttachments = &ps->out_view,
+        .attachmentCount = 1, .pAttachments = &ps->fbo_view,
         .width = ps->out_w, .height = ps->out_h, .layers = 1,
     };
     VK_CHECK(vkCreateFramebuffer(p->dev, &fbci, NULL, &ps->framebuffer),
@@ -881,6 +1066,7 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
     if (create_image(p, input_w, input_h, FMT,
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     1,
                      &p->in_img, &p->in_mem, err_out) != 0) goto fail;
     p->in_view = create_view(p->dev, p->in_img, FMT);
     {
@@ -901,9 +1087,7 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
     if (create_buffer(p, ubytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       &p->stg_upload, &p->stg_upload_mem, &p->stg_upload_ptr, err_out) != 0) goto fail;
-    if (create_buffer(p, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      &p->stg_readback, &p->stg_readback_mem, &p->stg_readback_ptr, err_out) != 0) goto fail;
+    if (create_readback_buffer(p, rbytes, err_out) != 0) goto fail;
 
     if (create_buffer(p, sizeof(QUAD_VERTS), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -989,7 +1173,17 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
                         ppass ? ppass->srgb_framebuffer  : 0,
                         ppass ? (int)ppass->fbo_format    : 0);
             }
-            if (alloc_pass_image(p, ps, ppass, pw, ph, pfmt, err_out) != 0) goto fail;
+            /* Mip chain on this pass's output is needed iff a downstream
+             * pass declared `mipmap_input<n> = true` (which targets that
+             * pass's Source = pass n-1's output). */
+            uint32_t mips = 1;
+            if (preset && preset->num_passes > 0 && i + 1 < preset->num_passes &&
+                preset->passes[i + 1].mipmap_input) {
+                mips = mip_levels_for(pw, ph);
+            }
+            if (alloc_pass_image(p, ps, ppass, pw, ph, pfmt, mips, err_out) != 0) goto fail;
+            if (getenv("SLANGFX_DEBUG_FORMAT") && mips > 1)
+                fprintf(stderr, "[pass %zu] mip_levels=%u\n", i, mips);
 
             prev_w = pw; prev_h = ph;
         }
@@ -1139,25 +1333,131 @@ fail:
 /* Per-frame dispatch                                                         */
 /* -------------------------------------------------------------------------- */
 
-static void barrier(VkCommandBuffer cmd, VkImage img,
-                    VkImageLayout from, VkImageLayout to,
-                    VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s,
-                    VkAccessFlags src_a, VkAccessFlags dst_a)
+static void barrier_range(VkCommandBuffer cmd, VkImage img,
+                          uint32_t base_mip, uint32_t mip_count,
+                          VkImageLayout from, VkImageLayout to,
+                          VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s,
+                          VkAccessFlags src_a, VkAccessFlags dst_a)
 {
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = src_a, .dstAccessMask = dst_a,
         .oldLayout = from, .newLayout = to, .image = img,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, base_mip, mip_count, 0, 1 },
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
     };
     vkCmdPipelineBarrier(cmd, src_s, dst_s, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
-int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst)
+static void barrier(VkCommandBuffer cmd, VkImage img,
+                    VkImageLayout from, VkImageLayout to,
+                    VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s,
+                    VkAccessFlags src_a, VkAccessFlags dst_a)
+{
+    barrier_range(cmd, img, 0, 1, from, to, src_s, dst_s, src_a, dst_a);
+}
+
+/* Generate a full mip chain for `img` via a vkCmdBlitImage cascade.
+ * Precondition: mip 0 is in SHADER_READ_ONLY layout (the renderpass's
+ * finalLayout); mip 1+ are in UNDEFINED. Postcondition: every level in
+ * SHADER_READ_ONLY, ready for downstream sampling. */
+static void generate_mipmaps(VkCommandBuffer cmd, VkImage img,
+                             uint32_t w, uint32_t h, uint32_t mip_levels)
+{
+    if (mip_levels <= 1) return;
+
+    /* mip 0: SHADER_READ_ONLY -> TRANSFER_SRC. */
+    barrier_range(cmd, img, 0, 1,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+    int32_t mw = (int32_t)w, mh = (int32_t)h;
+    for (uint32_t lvl = 1; lvl < mip_levels; ++lvl) {
+        int32_t nw = mw > 1 ? mw / 2 : 1;
+        int32_t nh = mh > 1 ? mh / 2 : 1;
+
+        /* dst: UNDEFINED -> TRANSFER_DST. */
+        barrier_range(cmd, img, lvl, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      0, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+        VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, lvl - 1, 0, 1 },
+            .srcOffsets = { {0,0,0}, { mw, mh, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, lvl, 0, 1 },
+            .dstOffsets = { {0,0,0}, { nw, nh, 1 } },
+        };
+        vkCmdBlitImage(cmd,
+                       img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+
+        /* dst: TRANSFER_DST -> TRANSFER_SRC (so next iteration can read from it). */
+        barrier_range(cmd, img, lvl, 1,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+        mw = nw; mh = nh;
+    }
+
+    /* All levels: TRANSFER_SRC -> SHADER_READ_ONLY. */
+    barrier_range(cmd, img, 0, mip_levels,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
+}
+
+int slang_pipeline_set_param(struct slang_pipeline *p,
+                             const char *name, float value)
+{
+    if (!p || !name) return 0;
+    int hits = 0;
+    for (size_t i = 0; i < p->num_passes; ++i) {
+        struct slang_module *mod = p->passes[i].mod;
+        if (!mod) continue;
+        for (size_t k = 0; k < mod->num_params; ++k) {
+            struct slang_param *pp = &mod->params[k];
+            if (!pp->name || strcmp(pp->name, name) != 0) continue;
+            float v = value;
+            /* Clamp to the declared range when it's a real interval. */
+            if (pp->max_value > pp->min_value) {
+                if (v < pp->min_value) v = pp->min_value;
+                if (v > pp->max_value) v = pp->max_value;
+            }
+            pp->default_value = v;   /* run() re-reads this every frame */
+            ++hits;
+        }
+    }
+    return hits;
+}
+
+int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst,
+                       double time_sec)
 {
     if (!p || !src || !dst) return -1;
+
+    /* Resolve the `Time` standard field (seconds). A realtime source supplies
+     * a real timestamp (PTS) so time-based effects stay correct under pacing
+     * and dropped frames; when it is unknown (time_sec < 0, e.g. the untimed
+     * stdio source) we fall back to a wall clock from the first frame. */
+    if (time_sec < 0.0) {
+        double now = slang_now_ms();
+        if (!p->clock_started) { p->clock_start_ms = now; p->clock_started = true; }
+        time_sec = (now - p->clock_start_ms) / 1000.0;
+    }
+    float time_val = (float)time_sec;
 
     /* 1. Upload input. */
     size_t ubytes = (size_t)p->input_w * p->input_h * 4;
@@ -1297,6 +1597,9 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             WRITE_FIELD(push_blob, sizeof(push_blob),
                         ps->mod->push_fields, ps->mod->num_push_fields, true,
                         "Rotation",           &rot,              4);
+            WRITE_FIELD(push_blob, sizeof(push_blob),
+                        ps->mod->push_fields, ps->mod->num_push_fields, true,
+                        "Time",               &time_val,         4);
 
             /* Populate UBO with the same standard fields if the shader
              * declared them there. */
@@ -1322,6 +1625,38 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             WRITE_FIELD(ubo, ps->ubo_size,
                         ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
                         "Rotation",           &rot,              4);
+            WRITE_FIELD(ubo, ps->ubo_size,
+                        ps->mod->ubo_fields, ps->mod->num_ubo_fields, false,
+                        "Time",               &time_val,         4);
+
+            /* Aliased / numbered / feedback `<TexName>Size` fields: the
+             * libretro slang spec lets shaders declare a vec4 size for any
+             * sampled texture (Pass<n>, alias, PassFeedback<n>, etc.).
+             * bloom_blend.slang and friends rely on this for sub-pixel
+             * snapping. We scan every reflected field and populate any
+             * `<X>Size` whose X resolves to a known pass. */
+            for (size_t k = 0; k < ps->mod->num_push_fields; ++k) {
+                uint32_t fw, fh;
+                if (lookup_size_field(p, ps->mod->push_fields[k].name, &fw, &fh)) {
+                    float sz[4] = { (float)fw, (float)fh,
+                                    1.0f / (float)fw, 1.0f / (float)fh };
+                    uint32_t off = ps->mod->push_fields[k].offset;
+                    if ((size_t)off + 16 <= sizeof(push_blob)) {
+                        memcpy(push_blob + off, sz, 16);
+                        if (off + 16 > push_size_used) push_size_used = off + 16;
+                    }
+                }
+            }
+            for (size_t k = 0; k < ps->mod->num_ubo_fields; ++k) {
+                uint32_t fw, fh;
+                if (lookup_size_field(p, ps->mod->ubo_fields[k].name, &fw, &fh)) {
+                    float sz[4] = { (float)fw, (float)fh,
+                                    1.0f / (float)fw, 1.0f / (float)fh };
+                    uint32_t off = ps->mod->ubo_fields[k].offset;
+                    if ((size_t)off + 16 <= ps->ubo_size)
+                        memcpy(ubo + off, sz, 16);
+                }
+            }
 
             /* Apply each #pragma parameter default at its resolved offset.
              * Try push first; if not found there, try the UBO. */
@@ -1383,8 +1718,13 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         vkCmdDrawIndexed(p->cmd, 6, 1, 0, 0, 0);
         vkCmdEndRenderPass(p->cmd);
 
-        /* Render pass leaves out_img in SHADER_READ_ONLY (next pass's
-         * Source binding can sample from it directly). */
+        /* Render pass leaves out_img mip 0 in SHADER_READ_ONLY (next
+         * pass's Source binding samples it directly). When this pass's
+         * output feeds a downstream `mipmap_input` pass, generate the
+         * full mip chain via vkCmdBlitImage cascade. */
+        if (ps->mip_levels > 1)
+            generate_mipmaps(p->cmd, ps->out_img, ps->out_w, ps->out_h, ps->mip_levels);
+
         prev_w = ps->out_w; prev_h = ps->out_h;
     }
 
@@ -1461,8 +1801,16 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     if (vkQueueSubmit(p->queue, 1, &si, p->fence) != VK_SUCCESS) return -4;
     vkWaitForFences(p->dev, 1, &p->fence, VK_TRUE, UINT64_MAX);
 
-    /* 4. Read back. */
+    /* 4. Read back. Cached readback memory needs an invalidate so the CPU
+     * sees the GPU's just-written bytes (no-op when the type is coherent). */
     size_t rbytes = (size_t)p->output_w * p->output_h * 4;
+    if (!p->stg_readback_coherent) {
+        VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = p->stg_readback_mem, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        vkInvalidateMappedMemoryRanges(p->dev, 1, &range);
+    }
     memcpy(dst, p->stg_readback_ptr, rbytes);
     return 0;
 }
@@ -1484,6 +1832,8 @@ static void destroy_pass(VkDevice dev, struct pass_state *ps)
     if (ps->feedback_view) vkDestroyImageView(dev, ps->feedback_view, NULL);
     if (ps->feedback_img)  vkDestroyImage(dev, ps->feedback_img, NULL);
     if (ps->feedback_mem)  vkFreeMemory(dev, ps->feedback_mem, NULL);
+    if (ps->fbo_view && ps->fbo_view != ps->out_view)
+        vkDestroyImageView(dev, ps->fbo_view, NULL);
     if (ps->out_view)      vkDestroyImageView(dev, ps->out_view, NULL);
     if (ps->out_img)       vkDestroyImage(dev, ps->out_img, NULL);
     if (ps->out_mem)       vkFreeMemory(dev, ps->out_mem, NULL);

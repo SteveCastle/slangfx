@@ -10,6 +10,10 @@ have been verified to run end-to-end. Most shaders work without
 modification; presets that depend on features not yet implemented are
 called out under [Limitations]({{ '/limitations.html' | relative_url }}).
 
+> For slangfx's **own** effect library (the presets shipped in `shaders/` —
+> colour, edges, blur/bloom, motion-reactive, glitch), see
+> [Bundled effects]({{ '/effects.html' | relative_url }}).
+
 ## Verified working
 
 ### CRT

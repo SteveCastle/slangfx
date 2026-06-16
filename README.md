@@ -128,6 +128,36 @@ presets that have been verified to run end-to-end:
 Some shaders depend on features not yet implemented — see
 [Limitations](https://SteveCastle.github.io/slangfx/limitations.html).
 
+### Bundled effects
+
+slangfx also ships its own library of original effects under [`shaders/`](shaders/)
+— colour grading, edge detection, blurs, blooms, motion-reactive feedback,
+tempo-synced beats, and glitch/analog looks (24 presets). They follow the same
+`.slangp` format, so they run anywhere a libretro preset does:
+
+```bash
+python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/bloom/bloom.slangp -o out.mp4
+```
+
+A few to try: `bloom`, `sobel-neon`, `thermal`, `chroma-shift`, `kaleidoscope`,
+`tilt-shift`, `motion-trails`, `perlin-flow`, `voronoi-shatter`. Most expose an
+`amount` (0 = passthrough) plus tunable sliders. See the full catalogue with
+descriptions and parameters in
+[**Bundled effects**](https://SteveCastle.github.io/slangfx/effects.html)
+([`docs/effects.md`](docs/effects.md)). The easiest way to audition them is the
+live tuner (next section), whose **Shader** menu lists the whole folder.
+
+### Live preview & tuning
+
+`wrappers/slangfx_live.py` streams a clip through an effect in a window with one
+slider per parameter, switches shader/video from a menu, and exports the result
+to H.264. See [Usage → Live parameter tuner](https://SteveCastle.github.io/slangfx/usage.html).
+
+```bash
+python -m pip install -r wrappers/requirements.txt
+python wrappers/slangfx_live.py            # start empty; load a clip + effect from the menus
+```
+
 ### Tuning shader parameters
 
 slang shaders declare runtime parameters via `#pragma parameter`. Override
@@ -152,10 +182,14 @@ slangfx/
 │   ├── slang_compile.{c,h}    slang → SPIR-V via shaderc
 │   ├── slang_pipeline.{c,h}   Vulkan multi-pass dispatch
 │   └── spv_reflect.{c,h}      SPIR-V reflection for layout discovery
+├── shaders/                   bundled original effects (see docs/effects.md)
+│   └── <effect>/<effect>.slangp + .slang passes
 ├── wrappers/
-│   └── slangfx.py             ffmpeg | slangfx | ffmpeg orchestration
+│   ├── slangfx.py             ffmpeg | slangfx | ffmpeg orchestration
+│   ├── slangfx_live.py        live preview + param sliders + export (Dear PyGui)
+│   └── requirements.txt       Python deps for the live tuner
 ├── tests/                     unit tests + slang fixtures
-├── docs/                      GitHub Pages site (architecture, usage, etc.)
+├── docs/                      GitHub Pages site (architecture, usage, effects, etc.)
 ├── meson.build                build config
 └── README.md                  this file
 ```

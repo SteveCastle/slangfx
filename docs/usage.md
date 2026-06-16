@@ -26,7 +26,7 @@ python wrappers/slangfx.py \
 | `-i PATH` | (required) | Input video file. Anything ffmpeg can decode. |
 | `-o PATH` | (required) | Output file. Container inferred from extension. |
 | `--preset PATH` | (required) | Path to a `.slangp` preset. |
-| `--params 'k=v,...'` | none | Override `#pragma parameter` defaults at the CLI (planned: currently apply via the slangp's own `parameters = "..."` block). |
+| `--params 'k=v,...'` | none | Override `#pragma parameter` defaults at the CLI (applied by name to all passes that declare the parameter). |
 | `--slangfx PATH` | `slangfx` (PATH) | Path to the `slangfx` binary. |
 | `--ffmpeg PATH` | `ffmpeg` (PATH) | Path to ffmpeg. |
 | `--vcodec NAME` | `libx264` | Output video codec. Use `h264_nvenc` for hardware encode. |
@@ -56,10 +56,80 @@ audio from a second input (the original file).
 | `--preset PATH` | yes | — | Path to `.slangp` |
 | `--width N` | yes | — | Frame width in pixels |
 | `--height N` | yes | — | Frame height in pixels |
-| `--params 'k=v,...'` | no | — | Override declared parameters (parsed but currently applied via slangp `parameters = ...` block). |
+| `--params 'k=v,...'` | no | — | Override declared parameters by name (applied to every pass that declares each one). |
+| `--control-port N` | no | off | Bind `udp://127.0.0.1:N` and apply live `name=value` updates (newest wins), drained at each frame start. No rebuild. Powers the live tuner below. |
 | `--frame-history N` | no | 8 | Cap `OriginalHistory` ring depth. Most shaders use 0–2. |
 
 `slangfx --help` prints the full list.
+
+## 4. Live parameter tuner (Dear PyGui)
+
+`wrappers/slangfx_live.py` streams a video through a preset and shows it in a
+window with one slider per `#pragma parameter`. Dragging a slider sends a live
+`name=value` update over UDP (`--control-port`), applied on the next frame with
+no rebuild. The **menu bar** switches shader or video on the fly — the
+**Shader** and **Video** menus quick-pick every `.slangp` found under the
+shaders tree / every video beside the current one (plus a **Browse…** dialog),
+and the **Params** menu has copy/reset/pause. Switching restarts the
+ffmpeg|slangfx pair (each on a fresh control port) and rebuilds the sliders for
+the new preset; any source is letterboxed into a fixed preview so different
+aspect ratios just work. **Copy params** emits the `k=v,k=v` string for
+`slangfx --params` / `beat_cut --shader-params`.
+
+Install the preview tool's dependencies (the `slangfx` binary itself has none),
+then launch it. Both the video and the preset are **optional** — you can start
+empty and load them from the menus:
+
+```bash
+python -m pip install -r wrappers/requirements.txt
+python wrappers/slangfx_live.py                          # empty; load from menus
+python wrappers/slangfx_live.py -i my_clip.mp4           # play raw video, no shader
+python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp
+```
+
+Everything is switchable from the menu bar without relaunching:
+
+- **Shader →** *(none — raw video)*, any discovered `.slangp`, or *Browse…* — swaps the effect live.
+- **Video →** any discovered clip, or *Browse…* — swaps the source live.
+- **Params →** Copy params / Reset to defaults / Pause.
+- **Export →** render the current shader + slider values to an **H.264** file
+  (next to the source, or *Export as…* to choose a path).
+
+Drag any slider to change that parameter on the live video instantly.
+
+**Export** renders at the source's **native resolution and frame rate** (not
+the downscaled preview) and **copies the original audio stream** unchanged
+(libx264, CRF 20). While it runs it **pauses live playback** and takes over the
+preview pane with a **progress bar, status (frame / total, speed, time), and a
+live log**; this also frees the GPU so the export renders as fast as possible.
+When it finishes, a **Continue** button returns you to live play. With no shader
+loaded it's a plain H.264 transcode. The same export is scriptable headlessly:
+
+```bash
+python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp \
+  --params "cells=30,crack=2.5" --export out.mp4
+```
+
+**Empty / partial states:** with no video the preview is blank and prompts you
+to load one. With a video but no shader, it plays the **raw video** and the
+controls show "No shader loaded — use the Shader menu". Loading a shader builds
+its sliders; choosing *(none — raw video)* drops back to passthrough.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-i PATH` | (optional) | Video/image to stream (looped). Load from the Video menu if omitted. |
+| `--preset PATH` | (optional) | `.slangp` whose `#pragma parameter`s become sliders. Omitted = raw video until you pick one. |
+| `--shaders-dir DIR` | preset tree / cwd | Folder scanned to fill the Shader menu. |
+| `--videos-dir DIR` | input folder / cwd | Folder scanned to fill the Video menu. |
+| `--width N` / `--height N` | auto | Fixed preview size; sources are letterboxed into it. Width-only preserves the launch video's aspect (defaults to ≤1280 wide). |
+| `--fps N` | 30 | Preview frame rate. |
+| `--control-port N` | 9000 | Base UDP port for live updates (each switch uses the next port). |
+| `--params 'k=v,...'` | none | Seed the sliders with these values (also used by `--export`). |
+| `--export OUT` | off | Headless: render `-i` through `--preset` (with `--params`) to an H.264 file (original audio + res/fps) and exit. |
+| `--selftest` | off | Headless check: live control + a shader switch (no window). Requires `-i` and `--preset`. |
+
+The preview runs at 720p-ish by default so it stays smooth regardless of source
+resolution; the exported params apply unchanged at full render resolution.
 
 ### Environment variables
 
