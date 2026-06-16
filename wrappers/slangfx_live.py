@@ -29,6 +29,7 @@ Headless self-test (no window): verifies live control + a shader switch.
     python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp --selftest
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -284,32 +285,185 @@ def parse_params_str(s):
 # --------------------------------------------------------------------------
 # Export — full-resolution render to H.264 with the original audio.
 # --------------------------------------------------------------------------
-def export_video(args, video, preset, params_str, out_path):
-    """Render `video` through `preset` (with `params_str`) to an H.264 file at
-    the source's native resolution/fps, copying the original audio. Reuses
-    wrappers/slangfx.py for the shaded path; a plain libx264 transcode when no
-    preset is loaded. Blocking; returns (ok, message)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    if preset:
-        cmd = [sys.executable, os.path.join(here, "slangfx.py"),
-               "-i", video, "-o", out_path, "--preset", preset,
-               "--slangfx", args.slangfx, "--ffmpeg", args.ffmpeg]
-        if params_str:
-            cmd += ["--params", params_str]
-    else:
-        # No shader: straight H.264 transcode, copy audio, keep res/fps.
-        cmd = [args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-i", video, "-map", "0:v:0", "-map", "0:a?",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-               "-pix_fmt", "yuv420p", "-c:a", "copy", out_path]
+def _probe_wh_fr(ffmpeg, video):
+    """(w, h, r_frame_rate) of the source; falls back to 1920x1080@30."""
+    ffprobe = ffmpeg.replace("ffmpeg", "ffprobe")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
-    except Exception as e:
-        return False, f"export error: {e}"
-    if r.returncode == 0 and os.path.isfile(out_path):
-        return True, f"exported -> {out_path}"
-    tail = (r.stderr or r.stdout or "").strip().splitlines()
-    return False, "export failed: " + (tail[-1] if tail else f"rc={r.returncode}")
+        out = subprocess.check_output(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "json", video], text=True)
+        s = json.loads(out)["streams"][0]
+        return int(s["width"]), int(s["height"]), s.get("r_frame_rate", "30/1")
+    except Exception:
+        return 1920, 1080, "30/1"
+
+
+def probe_total_frames(ffmpeg, video):
+    """Best-effort total frame count: nb_frames, else duration*fps. 0 if
+    unknown (caller treats progress as indeterminate)."""
+    ffprobe = ffmpeg.replace("ffmpeg", "ffprobe")
+    try:
+        out = subprocess.check_output(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames,r_frame_rate,duration:format=duration",
+             "-of", "json", video], text=True)
+        d = json.loads(out)
+        s = d.get("streams", [{}])[0]
+        nb = s.get("nb_frames", "")
+        if nb.isdigit() and int(nb) > 0:
+            return int(nb)
+        dur = s.get("duration") or d.get("format", {}).get("duration")
+        num, _, den = s.get("r_frame_rate", "0/1").partition("/")
+        fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+        if dur and fps:
+            return int(round(float(dur) * fps))
+    except Exception:
+        pass
+    return 0
+
+
+class Exporter:
+    """Runs a full-resolution H.264 export in a background thread and exposes
+    pollable state: `progress` (0..1, or <0 if total unknown), `status`, `logs`
+    (list of lines), `done`, `ok`. The shaded path is ffmpeg | slangfx | ffmpeg
+    with `-progress` parsed from the encoder; without a preset it's a single
+    libx264 transcode. Original audio is copied; res/fps match the source."""
+
+    def __init__(self, args, video, preset, params_str, out_path):
+        self.args = args
+        self.video = video
+        self.preset = preset
+        self.params_str = params_str
+        self.out_path = out_path
+        self.progress = -1.0
+        self.status = "preparing..."
+        self.logs = []
+        self.done = False
+        self.ok = False
+        self.total = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def join(self, timeout=None):
+        self._thread.join(timeout)
+
+    def _log(self, line):
+        line = line.rstrip()
+        if line:
+            self.logs.append(line)
+            if len(self.logs) > 500:
+                del self.logs[:len(self.logs) - 500]
+
+    def _pump_logs(self, stream):
+        for raw in iter(stream.readline, b""):
+            self._log(raw.decode("utf-8", "replace"))
+
+    def _pump_progress(self, stream):
+        fps = spd = tm = None
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", "replace").strip()
+            k, _, v = line.partition("=")
+            if k == "frame":
+                try:
+                    cur = int(v)
+                except ValueError:
+                    continue
+                if self.total > 0:
+                    self.progress = min(1.0, cur / self.total)
+                self.status = (f"frame {cur}"
+                               + (f" / {self.total}" if self.total else "")
+                               + (f"   {spd}" if spd else "")
+                               + (f"   {tm}" if tm else ""))
+            elif k == "fps":
+                fps = v
+            elif k == "speed":
+                spd = v.strip()
+            elif k == "out_time":
+                tm = v.split(".")[0]
+            elif k == "progress" and v == "end" and self.total > 0:
+                self.progress = 1.0
+
+    def _run(self):
+        try:
+            self.total = probe_total_frames(self.args.ffmpeg, self.video)
+            threads, waits = self._spawn()
+            for t in threads:
+                t.join()
+            rc = 0
+            for p in waits:
+                rc = p.wait() or rc
+            self.ok = (rc == 0 and os.path.isfile(self.out_path))
+            self._log("done." if self.ok else f"pipeline returned {rc}")
+        except Exception as e:
+            self._log(f"error: {e}")
+            self.ok = False
+        finally:
+            if self.ok:
+                self.progress = 1.0
+                self.status = f"exported -> {self.out_path}"
+            else:
+                self.status = "export failed (see log)"
+            self.done = True
+
+    def _spawn(self):
+        a = self.args
+        if self.preset:
+            w, h, fr = _probe_wh_fr(a.ffmpeg, self.video)
+            self._log(f"export {w}x{h} @ {fr}  ->  {os.path.basename(self.out_path)}")
+            decode = [a.ffmpeg, "-hide_banner", "-loglevel", "error",
+                      "-i", self.video, "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+            proc = [a.slangfx, "--preset", self.preset,
+                    "--width", str(w), "--height", str(h)]
+            if self.params_str:
+                proc += ["--params", self.params_str]
+            encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                      "-progress", "pipe:1", "-nostats",
+                      "-f", "rawvideo", "-pix_fmt", "rgba",
+                      "-video_size", f"{w}x{h}", "-framerate", fr, "-i", "-",
+                      "-i", self.video, "-map", "0:v", "-map", "1:a?",
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                      "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest",
+                      self.out_path]
+            p1 = subprocess.Popen(decode, stdout=subprocess.PIPE)
+            p2 = subprocess.Popen(proc, stdin=p1.stdout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p1.stdout.close()
+            p3 = subprocess.Popen(encode, stdin=p2.stdout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p2.stdout.close()
+            threads = [
+                threading.Thread(target=self._pump_progress, args=(p3.stdout,), daemon=True),
+                threading.Thread(target=self._pump_logs, args=(p3.stderr,), daemon=True),
+                threading.Thread(target=self._pump_logs, args=(p2.stderr,), daemon=True),
+            ]
+        else:
+            self._log(f"export (no shader)  ->  {os.path.basename(self.out_path)}")
+            encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                      "-progress", "pipe:1", "-nostats", "-i", self.video,
+                      "-map", "0:v:0", "-map", "0:a?",
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                      "-pix_fmt", "yuv420p", "-c:a", "copy", self.out_path]
+            p1 = subprocess.Popen(encode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p2 = p3 = None
+            threads = [
+                threading.Thread(target=self._pump_progress, args=(p1.stdout,), daemon=True),
+                threading.Thread(target=self._pump_logs, args=(p1.stderr,), daemon=True),
+            ]
+        for t in threads:
+            t.start()
+        waits = [p for p in (p3, p2, p1) if p is not None]
+        return threads, waits
+
+
+def export_video(args, video, preset, params_str, out_path):
+    """Blocking export (used by --export). Returns (ok, message)."""
+    ex = Exporter(args, video, preset, params_str, out_path).start()
+    ex.join()
+    return ex.ok, ex.status
 
 
 def default_export_path(video, preset):
@@ -401,32 +555,45 @@ def run_gui(args, w, h, params):
         dpg.set_value("preview_tex", blank)
 
     # --- export -----------------------------------------------------------
-    export_state = {"busy": False, "msg": None, "shown": None}
-
     def current_params_string():
         return ",".join(f"{p['name']}={dpg.get_value('sld_' + p['name']):g}"
                         for p in state["params"])
 
-    def run_export(out_path):
+    def start_export(out_path):
         if not state["video"]:
             dpg.set_value("status", "load a video before exporting")
             return
-        if export_state["busy"]:
-            dpg.set_value("status", "an export is already running")
+        if state.get("export_view") or not out_path:
             return
-        video, preset = state["video"], state["preset"]
         params_str = current_params_string()
+        # Stop live playback so the export render gets the whole GPU.
+        if state["pipe"]:
+            state["pipe"].close()
+            state["pipe"] = None
+        set_blank()
+        # Take over the preview area with the export panel.
+        state["export_view"] = True
+        state["export_log_shown"] = 0
+        state["export_done_shown"] = False
+        state["exporter"] = Exporter(args, state["video"], state["preset"],
+                                     params_str, out_path)
+        dpg.set_value("export_title", "Exporting  (live playback paused)")
+        dpg.set_value("export_bar", 0.0)
+        dpg.configure_item("export_bar", overlay="0%")
+        dpg.set_value("export_stat", "starting...")
+        dpg.delete_item("export_log", children_only=True)
+        dpg.hide_item("export_continue")
+        dpg.hide_item("preview_img")
+        dpg.show_item("export_panel")
+        dpg.set_value("status", f"exporting -> {os.path.basename(out_path)}")
+        state["exporter"].start()
 
-        def worker():
-            export_state["busy"] = True
-            export_state["msg"] = (f"exporting -> {os.path.basename(out_path)} "
-                                   "(full resolution; this can take a while)...")
-            ok, msg = export_video(args, video, preset, params_str, out_path)
-            export_state["msg"] = msg
-            export_state["busy"] = False
-            print(msg, flush=True)
-
-        threading.Thread(target=worker, daemon=True).start()
+    def on_continue():
+        state["export_view"] = False
+        state["exporter"] = None
+        dpg.hide_item("export_panel")
+        dpg.show_item("preview_img")
+        start()                        # resume live playback (current video/preset)
 
     def open_export_dialog():
         if not state["video"]:
@@ -440,12 +607,15 @@ def run_gui(args, w, h, params):
     def on_export_pick(sender, app_data):
         f = app_data.get("file_path_name")
         if f:
-            run_export(f)
+            start_export(f)
 
     # --- switching --------------------------------------------------------
     def start(video=_UNSET, preset=_UNSET):
         """(Re)build the pipeline for the current video/preset. Either arg may
         be a path, None (explicitly clear), or omitted (keep current)."""
+        if state.get("export_view") and (video is not _UNSET or preset is not _UNSET):
+            dpg.set_value("status", "finish the export (Continue) before switching")
+            return
         if video is not _UNSET:
             state["video"] = os.path.abspath(video) if video else None
         if preset is not _UNSET:
@@ -539,14 +709,30 @@ def run_gui(args, w, h, params):
             with dpg.menu(label="Export"):
                 dpg.add_menu_item(
                     label="Export H.264 (next to source)",
-                    callback=lambda: run_export(
+                    callback=lambda: start_export(
                         default_export_path(state["video"], state["preset"])
                         if state["video"] else ""))
                 dpg.add_menu_item(label="Export as...",
                                   callback=open_export_dialog)
 
         with dpg.group(horizontal=True):
-            dpg.add_image("preview_tex", width=w, height=h)
+            with dpg.group():            # left column: preview OR export takeover
+                dpg.add_image("preview_tex", tag="preview_img", width=w, height=h)
+                with dpg.child_window(tag="export_panel", width=w, height=h,
+                                      show=False):
+                    dpg.add_spacer(height=6)
+                    dpg.add_text("Exporting", tag="export_title")
+                    dpg.add_progress_bar(tag="export_bar", width=w - 30,
+                                         default_value=0.0, overlay="0%")
+                    dpg.add_text("", tag="export_stat", color=(200, 200, 200))
+                    dpg.add_separator()
+                    dpg.add_text("log")
+                    dpg.add_child_window(tag="export_log", width=w - 30,
+                                         height=h - 200)
+                    dpg.add_spacer(height=6)
+                    dpg.add_button(label="Continue (back to live play)",
+                                   tag="export_continue", show=False,
+                                   callback=on_continue)
             with dpg.child_window(width=340, autosize_y=True):
                 dpg.add_text("(no shader)", tag="preset_label")
                 dpg.add_separator()
@@ -567,18 +753,38 @@ def run_gui(args, w, h, params):
 
     scale = np.float32(1.0 / 255.0)
     while dpg.is_dearpygui_running():
-        p = state["pipe"]
-        if p:
-            buf = p.get_latest()
-            if buf is not None:
-                arr = np.frombuffer(buf, dtype=np.uint8).astype(np.float32) * scale
-                dpg.set_value("preview_tex", arr)
-            if not p.running and p.frames == 0:
-                dpg.set_value("status", "could not open source (check the file)")
-        # Surface export progress/result from the worker thread.
-        if export_state["msg"] and export_state["msg"] != export_state["shown"]:
-            dpg.set_value("status", export_state["msg"])
-            export_state["shown"] = export_state["msg"]
+        ex = state.get("exporter")
+        if ex is not None:
+            # Export takeover: drive the progress bar, status, and log panel.
+            dpg.set_value("export_bar", ex.progress if ex.progress >= 0 else 0.0)
+            dpg.configure_item("export_bar",
+                               overlay=(f"{ex.progress * 100:.0f}%"
+                                        if ex.progress >= 0 else "working..."))
+            dpg.set_value("export_stat", ex.status)
+            shown = state.get("export_log_shown", 0)
+            if len(ex.logs) > shown:
+                for line in ex.logs[shown:]:
+                    dpg.add_text(line, parent="export_log", wrap=w - 50)
+                state["export_log_shown"] = len(ex.logs)
+                dpg.set_y_scroll("export_log", -1.0)
+            if ex.done and not state.get("export_done_shown"):
+                state["export_done_shown"] = True
+                dpg.set_value("export_title",
+                              "Export complete" if ex.ok else "Export failed")
+                if ex.ok:
+                    dpg.set_value("export_bar", 1.0)
+                    dpg.configure_item("export_bar", overlay="100%")
+                dpg.show_item("export_continue")
+                dpg.set_value("status", ex.status)
+        else:
+            p = state["pipe"]
+            if p:
+                buf = p.get_latest()
+                if buf is not None:
+                    arr = np.frombuffer(buf, dtype=np.uint8).astype(np.float32) * scale
+                    dpg.set_value("preview_tex", arr)
+                if not p.running and p.frames == 0:
+                    dpg.set_value("status", "could not open source (check the file)")
         dpg.render_dearpygui_frame()
 
     if state["pipe"]:

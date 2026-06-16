@@ -99,9 +99,11 @@ Drag any slider to change that parameter on the live video instantly.
 
 **Export** renders at the source's **native resolution and frame rate** (not
 the downscaled preview) and **copies the original audio stream** unchanged
-(libx264, CRF 20). It runs in the background — the status line shows progress
-and the final path. With no shader loaded it's a plain H.264 transcode. The
-same export is scriptable headlessly:
+(libx264, CRF 20). While it runs it **pauses live playback** and takes over the
+preview pane with a **progress bar, status (frame / total, speed, time), and a
+live log**; this also frees the GPU so the export renders as fast as possible.
+When it finishes, a **Continue** button returns you to live play. With no shader
+loaded it's a plain H.264 transcode. The same export is scriptable headlessly:
 
 ```bash
 python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp \
