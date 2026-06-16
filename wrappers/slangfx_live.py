@@ -157,7 +157,8 @@ class Pipeline:
     never blocks (newest-wins; stale frames are dropped). One Pipeline streams
     one (video, preset) pair; switching builds a fresh Pipeline."""
 
-    def __init__(self, slangfx, ffmpeg, video, preset, w, h, fps, port, params):
+    def __init__(self, slangfx, ffmpeg, video, preset, w, h, fps, port, params,
+                 realtime=True):
         self.w, self.h, self.fb = w, h, w * h * 4
         self.port = port
         self.params = params
@@ -172,11 +173,15 @@ class Pipeline:
         vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
               f"pad={w}:{h}:-1:-1:color=black,setsar=1")
         startup = ",".join(f"{p['name']}={p['default']}" for p in params)
-        self.ff = subprocess.Popen(
-            [ffmpeg, "-loglevel", "error", "-stream_loop", "-1",
-             "-i", video, "-vf", vf,
-             "-f", "rawvideo", "-pix_fmt", "rgba", "-r", str(fps), "-"],
-            stdout=subprocess.PIPE)
+        # `-re` paces ffmpeg to the source's native frame rate (real time);
+        # without it ffmpeg floods the pipe and the preview plays many times too
+        # fast. Off for the self-test, where we want frames as fast as possible.
+        ff_cmd = [ffmpeg, "-loglevel", "error", "-stream_loop", "-1"]
+        if realtime:
+            ff_cmd += ["-re"]
+        ff_cmd += ["-i", video, "-vf", vf,
+                   "-f", "rawvideo", "-pix_fmt", "rgba", "-r", str(fps), "-"]
+        self.ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE)
         self.sfx = subprocess.Popen(
             [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
              "--control-port", str(port), "--params", startup],
@@ -216,9 +221,9 @@ class Pipeline:
                 pass
 
 
-def make_pipeline(args, video, preset, w, h, port, params):
+def make_pipeline(args, video, preset, w, h, port, params, realtime=True):
     return Pipeline(args.slangfx, args.ffmpeg, video, preset,
-                    w, h, args.fps, port, params)
+                    w, h, args.fps, port, params, realtime=realtime)
 
 
 # --------------------------------------------------------------------------
@@ -423,8 +428,10 @@ def run_selftest(args, w, h, params):
     if not os.path.isfile(args.slangfx):
         print(f"SELFTEST FAIL: slangfx not found at {args.slangfx}"); return 2
 
-    # 1) Live control on the launch preset.
-    pipe = make_pipeline(args, args.input, args.preset, w, h, args.control_port, params)
+    # 1) Live control on the launch preset. (realtime=False: run unpaced so the
+    # test finishes fast — the GUI uses realtime pacing.)
+    pipe = make_pipeline(args, args.input, args.preset, w, h, args.control_port,
+                         params, realtime=False)
     d_static, d_change = (None, None)
     if any(p["name"] == "amount" for p in params):
         d_static, d_change = _verify_live_control(pipe, time.time() + 25)
@@ -447,7 +454,8 @@ def run_selftest(args, w, h, params):
     if others:
         p2 = others[0]
         params2 = discover_params(p2)
-        pipe2 = make_pipeline(args, args.input, p2, w, h, args.control_port + 1, params2)
+        pipe2 = make_pipeline(args, args.input, p2, w, h, args.control_port + 1,
+                              params2, realtime=False)
         _wait_frames(pipe2, 12, time.time() + 20)
         switch_ok = pipe2.frames >= 10 and bool(params2)
         print(f"[2] switched -> {os.path.basename(p2)}: frames {pipe2.frames}, "
