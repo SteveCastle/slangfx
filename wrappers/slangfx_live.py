@@ -13,10 +13,16 @@ Pipeline:  ffmpeg (decode+loop+letterbox) -> slangfx (--control-port) -> app
 Controls:  app -> UDP name=value -> slangfx
 Menu:      Shader / Video (quick-pick discovered files + Browse...), Params
 
+Both -i/--input and --preset are optional: start empty and load them from the
+menus, or pass a video with no preset to play it raw (no shader) until you pick
+one. The Shader/Video menus list files discovered under --shaders-dir/
+--videos-dir (defaulting sensibly), plus a Browse... dialog.
+
 Usage:
     python -m pip install -r wrappers/requirements.txt
-    python wrappers/slangfx_live.py -i my_clip.mp4 \
-        --preset path/to/effect.slangp [--width 1280]
+    python wrappers/slangfx_live.py                       # empty; load from menus
+    python wrappers/slangfx_live.py -i my_clip.mp4        # raw video, no shader
+    python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp
 
 Headless self-test (no window): verifies live control + a shader switch.
     python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp --selftest
@@ -99,27 +105,48 @@ def discover_params(preset_path):
 # --------------------------------------------------------------------------
 # File discovery for the menus
 # --------------------------------------------------------------------------
-def find_presets(start_preset):
-    """All .slangp presets under the shaders tree that holds `start_preset`
-    (its grandparent dir, e.g. shaders/), sorted."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(start_preset)))
+def find_presets(root):
+    """All .slangp presets under `root` (recursive), sorted. Empty if root is
+    missing/None."""
     found = []
-    for dp, _, files in os.walk(root):
-        for f in files:
-            if f.endswith(".slangp"):
-                found.append(os.path.join(dp, f))
+    if root and os.path.isdir(root):
+        for dp, _, files in os.walk(root):
+            for f in files:
+                if f.endswith(".slangp"):
+                    found.append(os.path.join(dp, f))
     return sorted(set(found))
 
 
-def find_videos(start_video):
-    """Sibling videos in the folder of `start_video`, sorted."""
-    root = os.path.dirname(os.path.abspath(start_video))
+def find_videos(root):
+    """Videos directly in `root`, sorted. Empty if root is missing/None."""
+    if not root or not os.path.isdir(root):
+        return []
     try:
         names = os.listdir(root)
     except OSError:
         return []
     return sorted(os.path.join(root, f) for f in names
                   if f.lower().endswith(VIDEO_EXTS))
+
+
+def shaders_root_for(args):
+    """Directory to scan for presets: explicit --shaders-dir, else the shaders
+    tree holding --preset (its grandparent), else the cwd."""
+    if args.shaders_dir:
+        return args.shaders_dir
+    if args.preset:
+        return os.path.dirname(os.path.dirname(os.path.abspath(args.preset)))
+    return os.getcwd()
+
+
+def videos_root_for(args):
+    """Directory to scan for videos: explicit --videos-dir, else the folder of
+    --input, else the cwd."""
+    if args.videos_dir:
+        return args.videos_dir
+    if args.input:
+        return os.path.dirname(os.path.abspath(args.input))
+    return os.getcwd()
 
 
 # --------------------------------------------------------------------------
@@ -140,22 +167,26 @@ def _probe_dims(ffmpeg, path):
 
 
 def preview_size(args):
-    """Resolve preview WxH, preserving source aspect when only width is given.
-    Fixed for the session: every source is letterboxed into this size, so
-    switching to a different-aspect video needs no texture recreation."""
+    """Resolve the fixed preview WxH. Every source is letterboxed into this
+    size, so it's chosen once: from the launch video's aspect when there is
+    one, else a 16:9 default (a video loaded later just letterboxes into it)."""
     if args.width and args.height:
         return args.width, args.height
-    sw, sh = _probe_dims(args.ffmpeg, args.input)
+    if args.input:
+        sw, sh = _probe_dims(args.ffmpeg, args.input)
+    else:
+        sw, sh = 1280, 720
     w = args.width or min(1280, sw)
     h = args.height or max(2, round(w * sh / sw / 2) * 2)
     return int(w), int(h)
 
 
 class Pipeline:
-    """ffmpeg | slangfx subprocess pair feeding RGBA frames, plus a UDP
-    control channel. A reader thread keeps only the latest frame so the UI
-    never blocks (newest-wins; stale frames are dropped). One Pipeline streams
-    one (video, preset) pair; switching builds a fresh Pipeline."""
+    """Feeds letterboxed RGBA frames from one (video, preset) pair. With a
+    preset it's ffmpeg | slangfx (+ a UDP control channel); with preset=None it
+    is ffmpeg alone (raw video, no shader). A reader thread keeps only the
+    latest frame so the UI never blocks (newest-wins; stale frames dropped).
+    Switching video/preset builds a fresh Pipeline."""
 
     def __init__(self, slangfx, ffmpeg, video, preset, w, h, fps, port, params,
                  realtime=True):
@@ -172,7 +203,6 @@ class Pipeline:
         # Letterbox any source into the fixed WxH so the texture never resizes.
         vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
               f"pad={w}:{h}:-1:-1:color=black,setsar=1")
-        startup = ",".join(f"{p['name']}={p['default']}" for p in params)
         # `-re` paces ffmpeg to the source's native frame rate (real time);
         # without it ffmpeg floods the pipe and the preview plays many times too
         # fast. Off for the self-test, where we want frames as fast as possible.
@@ -182,16 +212,24 @@ class Pipeline:
         ff_cmd += ["-i", video, "-vf", vf,
                    "-f", "rawvideo", "-pix_fmt", "rgba", "-r", str(fps), "-"]
         self.ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE)
-        self.sfx = subprocess.Popen(
-            [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
-             "--control-port", str(port), "--params", startup],
-            stdin=self.ff.stdout, stdout=subprocess.PIPE)
-        self.ff.stdout.close()
+
+        if preset:
+            startup = ",".join(f"{p['name']}={p['default']}" for p in params)
+            self.sfx = subprocess.Popen(
+                [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
+                 "--control-port", str(port), "--params", startup],
+                stdin=self.ff.stdout, stdout=subprocess.PIPE)
+            self.ff.stdout.close()
+            self.src = self.sfx.stdout         # shaded frames
+        else:
+            self.sfx = None
+            self.src = self.ff.stdout          # raw (letterboxed) video frames
+
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
 
     def _read_loop(self):
-        rd = self.sfx.stdout
+        rd = self.src
         while self.running:
             buf = rd.read(self.fb)
             if not buf or len(buf) < self.fb:
@@ -207,6 +245,8 @@ class Pipeline:
             return self.latest
 
     def set_param(self, name, value):
+        if self.sfx is None:               # no shader -> nothing to control
+            return
         try:
             self.sock.sendto(f"{name}={value}".encode(), ("127.0.0.1", self.port))
         except OSError:
@@ -214,7 +254,8 @@ class Pipeline:
 
     def close(self):
         self.running = False
-        for p in (self.sfx, self.ff):
+        procs = [self.ff] if self.sfx is None else [self.sfx, self.ff]
+        for p in procs:
             try:
                 p.terminate()
             except Exception:
@@ -229,26 +270,34 @@ def make_pipeline(args, video, preset, w, h, port, params, realtime=True):
 # --------------------------------------------------------------------------
 # GUI (Dear PyGui)
 # --------------------------------------------------------------------------
+_UNSET = object()   # "argument not provided" sentinel (None is a real value)
+
+
 def run_gui(args, w, h, params):
     import dearpygui.dearpygui as dpg
     import numpy as np
 
-    presets = find_presets(args.preset)
-    videos = find_videos(args.input)
+    presets = find_presets(shaders_root_for(args))
+    videos = find_videos(videos_root_for(args))
 
     state = {
-        "video": os.path.abspath(args.input),
-        "preset": os.path.abspath(args.preset),
+        "video": os.path.abspath(args.input) if args.input else None,
+        "preset": os.path.abspath(args.preset) if args.preset else None,
         "params": params,
         "port": args.control_port,
         "pipe": None,
     }
 
     dpg.create_context()
-    blank = [0.0] * (w * h * 4)
+    # Dark empty-state fill so the preview pane reads as "waiting", not broken.
+    blank = np.full(w * h * 4, 0.10, dtype=np.float32)
+    blank[3::4] = 1.0
     with dpg.texture_registry():
         dpg.add_raw_texture(width=w, height=h, default_value=blank,
                             format=dpg.mvFormat_Float_rgba, tag="preview_tex")
+
+    def name_or(path, fallback):
+        return os.path.basename(path) if path else fallback
 
     # --- param controls ---------------------------------------------------
     def on_slider(sender, value, name):
@@ -256,6 +305,9 @@ def run_gui(args, w, h, params):
             state["pipe"].set_param(name, value)
 
     def copy_params():
+        if not state["params"]:
+            dpg.set_value("status", "no shader loaded — nothing to copy")
+            return
         s = ",".join(f"{p['name']}={dpg.get_value('sld_' + p['name']):g}"
                      for p in state["params"])
         dpg.set_clipboard_text(s)
@@ -267,7 +319,8 @@ def run_gui(args, w, h, params):
             dpg.set_value("sld_" + p["name"], p["default"])
             if state["pipe"]:
                 state["pipe"].set_param(p["name"], p["default"])
-        dpg.set_value("status", "reset to defaults")
+        if state["params"]:
+            dpg.set_value("status", "reset to defaults")
 
     def toggle_pause():
         p = state["pipe"]
@@ -277,7 +330,15 @@ def run_gui(args, w, h, params):
 
     def rebuild_sliders():
         dpg.delete_item("sliders", children_only=True)
-        dpg.set_value("preset_label", os.path.basename(state["preset"]))
+        dpg.set_value("preset_label", name_or(state["preset"], "(no shader)"))
+        if not state["params"]:
+            # Empty state for the shader controls.
+            msg = ("No shader loaded — playing raw video.\n"
+                   "Use the Shader menu to add an effect."
+                   if state["video"] else
+                   "No shader loaded.\nUse the Shader menu to pick one.")
+            dpg.add_text(msg, parent="sliders", color=(170, 170, 170), wrap=300)
+            return
         for p in state["params"]:
             dpg.add_slider_float(
                 parent="sliders", label=p["label"] or p["name"],
@@ -285,27 +346,46 @@ def run_gui(args, w, h, params):
                 min_value=p["min"], max_value=p["max"], callback=on_slider,
                 user_data=p["name"], width=180)
 
+    def set_blank():
+        dpg.set_value("preview_tex", blank)
+
     # --- switching --------------------------------------------------------
-    def start(video=None, preset=None):
-        if video:
-            state["video"] = os.path.abspath(video)
-        if preset:
-            new_params = discover_params(os.path.abspath(preset))
-            if not new_params:
-                dpg.set_value("status",
-                              f"no #pragma params in {os.path.basename(preset)}")
-                return
-            state["preset"] = os.path.abspath(preset)
-            state["params"] = new_params
+    def start(video=_UNSET, preset=_UNSET):
+        """(Re)build the pipeline for the current video/preset. Either arg may
+        be a path, None (explicitly clear), or omitted (keep current)."""
+        if video is not _UNSET:
+            state["video"] = os.path.abspath(video) if video else None
+        if preset is not _UNSET:
+            if preset:
+                new_params = discover_params(os.path.abspath(preset))
+                if not new_params:
+                    dpg.set_value("status",
+                                  f"no #pragma params in {os.path.basename(preset)}")
+                    return
+                state["preset"] = os.path.abspath(preset)
+                state["params"] = new_params
+            else:
+                state["preset"] = None
+                state["params"] = []
+
         if state["pipe"]:
             state["pipe"].close()
+            state["pipe"] = None
+
+        if not state["video"]:
+            # Empty state: nothing to play yet.
+            set_blank()
+            rebuild_sliders()
+            dpg.set_value("status", "Load a video to begin (Video menu)")
+            return
+
         port = state["port"]
         state["port"] += 1                     # fresh port avoids any bind race
         state["pipe"] = make_pipeline(args, state["video"], state["preset"],
                                       w, h, port, state["params"])
         rebuild_sliders()
-        dpg.set_value("status", f"{os.path.basename(state['preset'])}  |  "
-                                f"{os.path.basename(state['video'])}")
+        shader = name_or(state["preset"], "raw video (no shader)")
+        dpg.set_value("status", f"{shader}  |  {name_or(state['video'], '')}")
 
     def on_pick_shader(sender, app_data):
         f = app_data.get("file_path_name")
@@ -334,11 +414,15 @@ def run_gui(args, w, h, params):
     with dpg.window(tag="main"):
         with dpg.menu_bar():
             with dpg.menu(label="Shader"):
+                dpg.add_menu_item(label="(none — raw video)",
+                                  callback=lambda: start(preset=None))
+                dpg.add_separator()
                 for pth in presets:
                     dpg.add_menu_item(
                         label=os.path.basename(pth),
                         callback=lambda s, a, u: start(preset=u), user_data=pth)
-                dpg.add_separator()
+                if presets:
+                    dpg.add_separator()
                 dpg.add_menu_item(label="Browse .slangp...",
                                   callback=lambda: dpg.show_item("dlg_shader"))
             with dpg.menu(label="Video"):
@@ -346,7 +430,8 @@ def run_gui(args, w, h, params):
                     dpg.add_menu_item(
                         label=os.path.basename(pth),
                         callback=lambda s, a, u: start(video=u), user_data=pth)
-                dpg.add_separator()
+                if videos:
+                    dpg.add_separator()
                 dpg.add_menu_item(label="Browse video...",
                                   callback=lambda: dpg.show_item("dlg_video"))
             with dpg.menu(label="Params"):
@@ -357,7 +442,7 @@ def run_gui(args, w, h, params):
         with dpg.group(horizontal=True):
             dpg.add_image("preview_tex", width=w, height=h)
             with dpg.child_window(width=340, autosize_y=True):
-                dpg.add_text(os.path.basename(state["preset"]), tag="preset_label")
+                dpg.add_text("(no shader)", tag="preset_label")
                 dpg.add_separator()
                 dpg.add_child_window(tag="sliders", autosize_x=True, height=-64)
                 dpg.add_separator()
@@ -372,7 +457,7 @@ def run_gui(args, w, h, params):
     dpg.show_viewport()
     dpg.set_primary_window("main", True)
 
-    start()   # launch the initial pipeline + build its sliders
+    start()   # build initial state (plays if a video was given, else empty)
 
     scale = np.float32(1.0 / 255.0)
     while dpg.is_dearpygui_running():
@@ -382,8 +467,8 @@ def run_gui(args, w, h, params):
             if buf is not None:
                 arr = np.frombuffer(buf, dtype=np.uint8).astype(np.float32) * scale
                 dpg.set_value("preview_tex", arr)
-            if not p.running:
-                dpg.set_value("status", "stream ended (switch shader/video to restart)")
+            if not p.running and p.frames == 0:
+                dpg.set_value("status", "could not open source (check the file)")
         dpg.render_dearpygui_frame()
 
     if state["pipe"]:
@@ -448,7 +533,7 @@ def run_selftest(args, w, h, params):
         print("    live control: skipped (no 'amount' param)")
 
     # 2) Switch to a different preset and confirm frames flow + params change.
-    others = [p for p in find_presets(args.preset)
+    others = [p for p in find_presets(shaders_root_for(args))
               if os.path.abspath(p) != os.path.abspath(args.preset)]
     switch_ok = True
     if others:
@@ -473,8 +558,18 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-i", "--input", required=True, help="Video/image to stream.")
-    ap.add_argument("--preset", required=True, help="Path to a .slangp preset.")
+    ap.add_argument("-i", "--input", default=None,
+                    help="Video/image to stream. Optional — load one from the "
+                         "Video menu in the UI.")
+    ap.add_argument("--preset", default=None,
+                    help="Path to a .slangp preset. Optional — load one from the "
+                         "Shader menu in the UI; without one the video plays raw.")
+    ap.add_argument("--shaders-dir", default=None,
+                    help="Directory scanned to populate the Shader menu "
+                         "(default: the --preset's shaders tree, else cwd).")
+    ap.add_argument("--videos-dir", default=None,
+                    help="Directory scanned to populate the Video menu "
+                         "(default: the --input's folder, else cwd).")
     ap.add_argument("--width", type=int, default=0, help="Preview width (px).")
     ap.add_argument("--height", type=int, default=0, help="Preview height (px).")
     ap.add_argument("--fps", type=int, default=30, help="Preview frame rate.")
@@ -483,18 +578,25 @@ def main():
                     os.path.join(here, "..", "build", "slangfx.exe"))
     ap.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
     ap.add_argument("--selftest", action="store_true",
-                    help="Run headless; verify live control and a shader switch.")
+                    help="Run headless; verify live control and a shader switch. "
+                         "Requires --input and --preset.")
     args = ap.parse_args()
 
-    if not os.path.isfile(args.preset):
+    if args.preset and not os.path.isfile(args.preset):
         sys.exit(f"preset not found: {args.preset}")
-    params = discover_params(args.preset)
-    if not params:
+    if args.input and not os.path.isfile(args.input):
+        sys.exit(f"input not found: {args.input}")
+    params = discover_params(args.preset) if args.preset else []
+    if args.preset and not params:
         sys.exit(f"no #pragma parameters found in {args.preset}")
-    w, h = preview_size(args)
 
     if args.selftest:
+        if not args.input or not args.preset:
+            sys.exit("--selftest requires both --input and --preset")
+        w, h = preview_size(args)
         sys.exit(run_selftest(args, w, h, params))
+
+    w, h = preview_size(args)
     run_gui(args, w, h, params)
 
 

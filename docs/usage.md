@@ -77,31 +77,39 @@ aspect ratios just work. **Copy params** emits the `k=v,k=v` string for
 `slangfx --params` / `beat_cut --shader-params`.
 
 Install the preview tool's dependencies (the `slangfx` binary itself has none),
-then launch it on any clip and preset:
+then launch it. Both the video and the preset are **optional** — you can start
+empty and load them from the menus:
 
 ```bash
 python -m pip install -r wrappers/requirements.txt
-python wrappers/slangfx_live.py -i my_clip.mp4 \
-  --preset path/to/effect.slangp        # add --width 1280 to set preview size
+python wrappers/slangfx_live.py                          # empty; load from menus
+python wrappers/slangfx_live.py -i my_clip.mp4           # play raw video, no shader
+python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp
 ```
 
-Once the window is open you don't need to relaunch to try other looks — use the
-menu bar:
+Everything is switchable from the menu bar without relaunching:
 
-- **Shader →** pick any discovered `.slangp` (or *Browse…*) to swap the effect live.
-- **Video →** pick any sibling clip (or *Browse…*) to swap the source live.
+- **Shader →** *(none — raw video)*, any discovered `.slangp`, or *Browse…* — swaps the effect live.
+- **Video →** any discovered clip, or *Browse…* — swaps the source live.
 - **Params →** Copy params / Reset to defaults / Pause.
 
 Drag any slider to change that parameter on the live video instantly.
 
+**Empty / partial states:** with no video the preview is blank and prompts you
+to load one. With a video but no shader, it plays the **raw video** and the
+controls show "No shader loaded — use the Shader menu". Loading a shader builds
+its sliders; choosing *(none — raw video)* drops back to passthrough.
+
 | Flag | Default | Effect |
 |---|---|---|
-| `-i PATH` | (required) | Video/image to stream (looped). |
-| `--preset PATH` | (required) | `.slangp` whose `#pragma parameter`s become sliders. |
-| `--width N` / `--height N` | auto | Preview size; width-only preserves source aspect (defaults to ≤1280 wide). |
+| `-i PATH` | (optional) | Video/image to stream (looped). Load from the Video menu if omitted. |
+| `--preset PATH` | (optional) | `.slangp` whose `#pragma parameter`s become sliders. Omitted = raw video until you pick one. |
+| `--shaders-dir DIR` | preset tree / cwd | Folder scanned to fill the Shader menu. |
+| `--videos-dir DIR` | input folder / cwd | Folder scanned to fill the Video menu. |
+| `--width N` / `--height N` | auto | Fixed preview size; sources are letterboxed into it. Width-only preserves the launch video's aspect (defaults to ≤1280 wide). |
 | `--fps N` | 30 | Preview frame rate. |
 | `--control-port N` | 9000 | Base UDP port for live updates (each switch uses the next port). |
-| `--selftest` | off | Headless check: confirms live control works and a shader switch succeeds (no window). |
+| `--selftest` | off | Headless check: live control + a shader switch (no window). Requires `-i` and `--preset`. |
 
 The preview runs at 720p-ish by default so it stays smooth regardless of source
 resolution; the exported params apply unchanged at full render resolution.
