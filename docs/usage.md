@@ -67,8 +67,14 @@ audio from a second input (the original file).
 `wrappers/slangfx_live.py` streams a video through a preset and shows it in a
 window with one slider per `#pragma parameter`. Dragging a slider sends a live
 `name=value` update over UDP (`--control-port`), applied on the next frame with
-no rebuild. **Copy params** emits the `k=v,k=v` string for `slangfx --params` /
-`beat_cut --shader-params`.
+no rebuild. The **menu bar** switches shader or video on the fly — the
+**Shader** and **Video** menus quick-pick every `.slangp` found under the
+shaders tree / every video beside the current one (plus a **Browse…** dialog),
+and the **Params** menu has copy/reset/pause. Switching restarts the
+ffmpeg|slangfx pair (each on a fresh control port) and rebuilds the sliders for
+the new preset; any source is letterboxed into a fixed preview so different
+aspect ratios just work. **Copy params** emits the `k=v,k=v` string for
+`slangfx --params` / `beat_cut --shader-params`.
 
 ```bash
 pip install dearpygui numpy
