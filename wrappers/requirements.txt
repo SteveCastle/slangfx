@@ -1,0 +1,12 @@
+# Python dependencies for the slangfx wrapper tools (wrappers/*.py).
+#
+# slangfx itself is a C binary built with meson/ninja and has NO Python
+# dependencies. The batch wrapper (slangfx.py) is pure stdlib. These packages
+# are only needed by the live preview tool, slangfx_live.py:
+#
+#     python -m pip install -r wrappers/requirements.txt
+#
+# Tested with dearpygui 2.3 and numpy 2.4; the floors below are conservative.
+
+dearpygui>=1.11      # immediate-mode GUI: live texture preview + param sliders
+numpy>=1.21          # fast RGBA frame -> float texture conversion

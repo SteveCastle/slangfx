@@ -14,12 +14,12 @@ Controls:  app -> UDP name=value -> slangfx
 Menu:      Shader / Video (quick-pick discovered files + Browse...), Params
 
 Usage:
-    pip install dearpygui numpy
-    python wrappers/slangfx_live.py -i video.mp4 \
-        --preset ../shaders/perlin-flow/perlin-flow.slangp [--width 1280]
+    python -m pip install -r wrappers/requirements.txt
+    python wrappers/slangfx_live.py -i my_clip.mp4 \
+        --preset path/to/effect.slangp [--width 1280]
 
 Headless self-test (no window): verifies live control + a shader switch.
-    python wrappers/slangfx_live.py -i still_or_video --preset P --selftest
+    python wrappers/slangfx_live.py -i my_clip.mp4 --preset path/to/effect.slangp --selftest
 """
 import argparse
 import os

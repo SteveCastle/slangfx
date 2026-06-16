@@ -76,11 +76,23 @@ the new preset; any source is letterboxed into a fixed preview so different
 aspect ratios just work. **Copy params** emits the `k=v,k=v` string for
 `slangfx --params` / `beat_cut --shader-params`.
 
+Install the preview tool's dependencies (the `slangfx` binary itself has none),
+then launch it on any clip and preset:
+
 ```bash
-pip install dearpygui numpy
-python wrappers/slangfx_live.py -i input.mp4 \
-  --preset path/to/preset.slangp        # add --width 1280 to set preview size
+python -m pip install -r wrappers/requirements.txt
+python wrappers/slangfx_live.py -i my_clip.mp4 \
+  --preset path/to/effect.slangp        # add --width 1280 to set preview size
 ```
+
+Once the window is open you don't need to relaunch to try other looks — use the
+menu bar:
+
+- **Shader →** pick any discovered `.slangp` (or *Browse…*) to swap the effect live.
+- **Video →** pick any sibling clip (or *Browse…*) to swap the source live.
+- **Params →** Copy params / Reset to defaults / Pause.
+
+Drag any slider to change that parameter on the live video instantly.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -88,8 +100,8 @@ python wrappers/slangfx_live.py -i input.mp4 \
 | `--preset PATH` | (required) | `.slangp` whose `#pragma parameter`s become sliders. |
 | `--width N` / `--height N` | auto | Preview size; width-only preserves source aspect (defaults to ≤1280 wide). |
 | `--fps N` | 30 | Preview frame rate. |
-| `--control-port N` | 9000 | UDP port for live updates. |
-| `--selftest` | off | Headless check: confirms frames flow and a live update changes the render (no window). |
+| `--control-port N` | 9000 | Base UDP port for live updates (each switch uses the next port). |
+| `--selftest` | off | Headless check: confirms live control works and a shader switch succeeds (no window). |
 
 The preview runs at 720p-ish by default so it stays smooth regardless of source
 resolution; the exported params apply unchanged at full render resolution.
