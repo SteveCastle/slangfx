@@ -1419,6 +1419,30 @@ static void generate_mipmaps(VkCommandBuffer cmd, VkImage img,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
 }
 
+int slang_pipeline_set_param(struct slang_pipeline *p,
+                             const char *name, float value)
+{
+    if (!p || !name) return 0;
+    int hits = 0;
+    for (size_t i = 0; i < p->num_passes; ++i) {
+        struct slang_module *mod = p->passes[i].mod;
+        if (!mod) continue;
+        for (size_t k = 0; k < mod->num_params; ++k) {
+            struct slang_param *pp = &mod->params[k];
+            if (!pp->name || strcmp(pp->name, name) != 0) continue;
+            float v = value;
+            /* Clamp to the declared range when it's a real interval. */
+            if (pp->max_value > pp->min_value) {
+                if (v < pp->min_value) v = pp->min_value;
+                if (v > pp->max_value) v = pp->max_value;
+            }
+            pp->default_value = v;   /* run() re-reads this every frame */
+            ++hits;
+        }
+    }
+    return hits;
+}
+
 int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst,
                        double time_sec)
 {

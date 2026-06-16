@@ -55,6 +55,16 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
 int slang_pipeline_run(struct slang_pipeline *p,
                        const uint8_t *src, uint8_t *dst, double time_sec);
 
+/* Live-update a #pragma parameter by name. Sets the value (clamped to the
+ * param's declared [min,max]) on every pass that declares `name`; the change
+ * takes effect on the next slang_pipeline_run with no rebuild, because run()
+ * re-reads each param into the push constants every frame.
+ *
+ * Returns the number of pass-level params updated (0 = name not found in any
+ * pass, so callers can warn on typos). Safe to call between frames. */
+int slang_pipeline_set_param(struct slang_pipeline *p,
+                             const char *name, float value);
+
 void slang_pipeline_destroy(struct slang_pipeline *p);
 
 #endif /* VF_SLANG_PIPELINE_H */

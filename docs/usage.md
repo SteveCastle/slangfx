@@ -26,7 +26,7 @@ python wrappers/slangfx.py \
 | `-i PATH` | (required) | Input video file. Anything ffmpeg can decode. |
 | `-o PATH` | (required) | Output file. Container inferred from extension. |
 | `--preset PATH` | (required) | Path to a `.slangp` preset. |
-| `--params 'k=v,...'` | none | Override `#pragma parameter` defaults at the CLI (planned: currently apply via the slangp's own `parameters = "..."` block). |
+| `--params 'k=v,...'` | none | Override `#pragma parameter` defaults at the CLI (applied by name to all passes that declare the parameter). |
 | `--slangfx PATH` | `slangfx` (PATH) | Path to the `slangfx` binary. |
 | `--ffmpeg PATH` | `ffmpeg` (PATH) | Path to ffmpeg. |
 | `--vcodec NAME` | `libx264` | Output video codec. Use `h264_nvenc` for hardware encode. |
@@ -56,10 +56,37 @@ audio from a second input (the original file).
 | `--preset PATH` | yes | — | Path to `.slangp` |
 | `--width N` | yes | — | Frame width in pixels |
 | `--height N` | yes | — | Frame height in pixels |
-| `--params 'k=v,...'` | no | — | Override declared parameters (parsed but currently applied via slangp `parameters = ...` block). |
+| `--params 'k=v,...'` | no | — | Override declared parameters by name (applied to every pass that declares each one). |
+| `--control-port N` | no | off | Bind `udp://127.0.0.1:N` and apply live `name=value` updates (newest wins), drained at each frame start. No rebuild. Powers the live tuner below. |
 | `--frame-history N` | no | 8 | Cap `OriginalHistory` ring depth. Most shaders use 0–2. |
 
 `slangfx --help` prints the full list.
+
+## 4. Live parameter tuner (Dear PyGui)
+
+`wrappers/slangfx_live.py` streams a video through a preset and shows it in a
+window with one slider per `#pragma parameter`. Dragging a slider sends a live
+`name=value` update over UDP (`--control-port`), applied on the next frame with
+no rebuild. **Copy params** emits the `k=v,k=v` string for `slangfx --params` /
+`beat_cut --shader-params`.
+
+```bash
+pip install dearpygui numpy
+python wrappers/slangfx_live.py -i input.mp4 \
+  --preset path/to/preset.slangp        # add --width 1280 to set preview size
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-i PATH` | (required) | Video/image to stream (looped). |
+| `--preset PATH` | (required) | `.slangp` whose `#pragma parameter`s become sliders. |
+| `--width N` / `--height N` | auto | Preview size; width-only preserves source aspect (defaults to ≤1280 wide). |
+| `--fps N` | 30 | Preview frame rate. |
+| `--control-port N` | 9000 | UDP port for live updates. |
+| `--selftest` | off | Headless check: confirms frames flow and a live update changes the render (no window). |
+
+The preview runs at 720p-ish by default so it stays smooth regardless of source
+resolution; the exported params apply unchanged at full render resolution.
 
 ### Environment variables
 

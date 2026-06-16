@@ -35,9 +35,22 @@ a mergeable chunk that ends with a demo and a test.
 - **R2 (time base) — done & verified.** Wall-clock `Time` standard field
   threaded through `slang_pipeline_run`; PTS-driven when a source supplies it,
   internal wall clock otherwise. Verified advancing at 1.0/sec.
-- **R2 (threading/device-pipelining), R3–R8 — designed, not yet built.** These
-  require a window / audio device / hwaccel interop that the headless build/CI
-  cannot exercise; they remain as specified below.
+- **R4 (live parameter control plane) — done & verified.** `slangfx
+  --control-port N` binds a non-blocking localhost UDP socket and applies
+  `name=value` updates (drained at each frame start) via
+  `slang_pipeline_set_param`, which mutates the param the render loop already
+  re-reads every frame — no rebuild. This also wired up the previously dead
+  `--params` flag (it was parsed but never applied). The control surface is
+  `wrappers/slangfx_live.py`, a Dear PyGui app that streams a video through a
+  preset and auto-builds one slider per `#pragma parameter`. Verified headless
+  (`slangfx_live.py --selftest`): with an `amount=0` passthrough baseline the
+  output is byte-static, and a live UDP update changes it sharply. MIDI/OSC
+  inputs and the mapping config remain as future R4 extensions.
+- **R2 (threading/device-pipelining), R3, R5–R8 — designed, not yet built.**
+  These require a window / audio device / hwaccel interop that the headless
+  build/CI cannot exercise; they remain as specified below. (R4's preview is
+  handled by the separate `slangfx_live.py` app, so R3's in-binary swapchain is
+  not a prerequisite for live tuning.)
 
 ## The four things that block realtime
 
@@ -133,14 +146,21 @@ stalled source does not stall render.
 **Exit:** a live media file plays through an effect on screen with bounded
 latency and no readback.
 
-### R4 — Live parameter control plane *(M)*
+### R4 — Live parameter control plane *(M)* — **done & verified**
 
-- Shared param table consumed as an atomic snapshot at each frame start (no
-  pipeline rebuild — completes the half-done `--params` plumbing).
-- Inputs: keyboard/hotkeys → OSC (UDP) → MIDI (RtMidi). A mapping config
-  (control → named param, with scale/curve).
+- Param values consumed at each frame start (the render loop already re-reads
+  each `#pragma parameter` into the push constants every frame), updated by
+  `slang_pipeline_set_param(name, value)` with no pipeline rebuild. Completes
+  the half-done `--params` plumbing (it was a no-op before).
+- Input transport: `--control-port N` → non-blocking localhost **UDP**,
+  `name=value` text (newest wins), drained per frame. Control surface:
+  `wrappers/slangfx_live.py` (Dear PyGui — live preview + auto sliders +
+  copy-params/reset/pause).
+- **Still open (future):** OSC/MIDI (RtMidi) inputs and a mapping config
+  (control → named param with scale/curve).
 
-**Exit:** a MIDI knob moves a shader param live with no hitch.
+**Exit (met):** dragging a slider moves a shader param on live video with no
+hitch; `slangfx_live.py --selftest` proves it headlessly.
 
 ### R5 — Audio reactivity *(M)*
 

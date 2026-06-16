@@ -93,6 +93,11 @@ if get_option('enable_gpu')
   slangfx_args += ['-DSLANGFX_GPU=1']
 endif
 
+# Live control plane (--control-port) uses UDP sockets; Winsock on Windows.
+if host_sys == 'windows'
+  slangfx_deps += cc.find_library('ws2_32')
+endif
+
 # Standalone executable. Reads raw RGBA from stdin, writes raw RGBA to stdout.
 # See src/main.c for the I/O protocol; wrappers/slangfx.py orchestrates the
 # usual ffmpeg-decode | slangfx | ffmpeg-encode pipeline.
