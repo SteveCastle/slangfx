@@ -12,9 +12,8 @@ W, H = 480, 270
 FB = W * H * 4
 PORT = 9777
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))            # beat-cut/
 SLANGFX = os.path.join(HERE, "..", "build", "slangfx.exe")
-PRESET = os.path.join(ROOT, "shaders", "perlin-flow", "perlin-flow.slangp")
+PRESET = os.path.join(HERE, "..", "shaders", "perlin-flow", "perlin-flow.slangp")
 STILL = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.environ.get("TEMP", "/tmp"), "frame_src.png")
 

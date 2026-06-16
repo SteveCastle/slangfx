@@ -133,11 +133,15 @@ def find_videos(root):
 
 def shaders_root_for(args):
     """Directory to scan for presets: explicit --shaders-dir, else the shaders
-    tree holding --preset (its grandparent), else the cwd."""
+    tree holding --preset (its grandparent), else the bundled slangfx/shaders
+    next to this script, else the cwd."""
     if args.shaders_dir:
         return args.shaders_dir
     if args.preset:
         return os.path.dirname(os.path.dirname(os.path.abspath(args.preset)))
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shaders")
+    if os.path.isdir(bundled):
+        return os.path.normpath(bundled)
     return os.getcwd()
 
 
