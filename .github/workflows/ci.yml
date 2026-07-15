@@ -1,0 +1,181 @@
+# CI: build the slangfx binary for Linux and Windows, run the parser tests,
+# and — on every push to main — create a tag + GitHub release carrying both
+# archives.
+#
+# Tagging scheme: the version is read from meson.build. The first main build
+# after a version bump gets the clean tag (v0.1.0); subsequent merges without
+# a bump get v0.1.0-build.<run_number> so every merge still produces a release.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-linux:
+    name: Build (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libvulkan-dev libshaderc-dev
+
+      - name: Configure
+        run: meson setup build -Denable_gpu=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Package
+        run: |
+          mkdir -p pkg/slangfx
+          cp build/slangfx pkg/slangfx/
+          cp -r shaders wrappers pkg/slangfx/
+          cp README.md LICENSE pkg/slangfx/
+          tar -C pkg -czf slangfx-linux-x86_64.tar.gz slangfx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slangfx-linux
+          path: slangfx-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look up latest Vulkan SDK version
+        id: vulkan
+        shell: pwsh
+        run: |
+          $ver = (Invoke-WebRequest -UseBasicParsing https://vulkan.lunarg.com/sdk/latest/windows.txt).Content.Trim()
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK
+          key: vulkan-sdk-${{ steps.vulkan.outputs.version }}
+
+      - name: Install Vulkan SDK
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.vulkan.outputs.version }}"
+          Invoke-WebRequest -UseBasicParsing "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
+          Start-Process -FilePath .\vulkan-sdk.exe -Wait -ArgumentList `
+            '--root','C:\VulkanSDK','--accept-licenses','--default-answer','--confirm-command','install'
+
+      - name: Export VULKAN_SDK
+        shell: pwsh
+        run: '"VULKAN_SDK=C:\VulkanSDK" >> $env:GITHUB_ENV'
+
+      # windows runner images ship a MinGW gcc, but the guard keeps us working
+      # if a future image drops it.
+      - name: Ensure MinGW gcc
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress
+            "C:\ProgramData\mingw64\mingw64\bin" >> $env:GITHUB_PATH
+            "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $env:GITHUB_PATH
+          }
+
+      - name: Install meson + ninja
+        run: python -m pip install meson ninja
+
+      - name: Configure
+        shell: pwsh
+        env:
+          CC: gcc
+        run: |
+          gcc --version
+          meson setup build -Denable_gpu=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg\slangfx | Out-Null
+          Copy-Item build\slangfx.exe pkg\slangfx\
+          Copy-Item "$env:VULKAN_SDK\Bin\shaderc_shared.dll" pkg\slangfx\
+          Copy-Item -Recurse shaders pkg\slangfx\shaders
+          Copy-Item -Recurse wrappers pkg\slangfx\wrappers
+          Copy-Item README.md, LICENSE pkg\slangfx\
+          Compress-Archive -Path pkg\slangfx -DestinationPath slangfx-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slangfx-windows
+          path: slangfx-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    name: Tag + Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute tag
+        id: tag
+        run: |
+          VERSION=$(sed -n "s/^[[:space:]]*version: '\([^']*\)'.*/\1/p" meson.build | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not parse version from meson.build"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            TAG="v$VERSION-build.$GITHUB_RUN_NUMBER"
+          else
+            TAG="v$VERSION"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Rename artifacts to include tag
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          mv dist/slangfx-linux-x86_64.tar.gz "dist/slangfx-$TAG-linux-x86_64.tar.gz"
+          mv dist/slangfx-windows-x86_64.zip "dist/slangfx-$TAG-windows-x86_64.zip"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" dist/* \
+            --title "slangfx ${{ steps.tag.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --generate-notes
