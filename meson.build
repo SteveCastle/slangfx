@@ -22,6 +22,12 @@ add_project_arguments(
   language: 'c',
 )
 
+# glibc hides POSIX declarations (clock_gettime, CLOCK_MONOTONIC, strtok_r,
+# strcasecmp) when compiling with strict -std=c11; opt back in.
+if host_sys != 'windows'
+  add_project_arguments('-D_GNU_SOURCE', language: 'c')
+endif
+
 # ---------------------------------------------------------------------------
 # Dependencies
 #
