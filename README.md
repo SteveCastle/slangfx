@@ -111,7 +111,9 @@ ffmpeg -i in.mp4 -f rawvideo -pix_fmt rgba - \
           -i in.mp4 -map 0:v -map 1:a -c:v libx264 -c:a copy out.mp4
 ```
 
-`slangfx --help` prints the full option list.
+`slangfx --help` prints the full option list. `--preset` is repeatable — each
+one is a layer, applied in order and chained on the GPU with no intermediate
+readback (a following `--params` binds to the preset before it).
 
 ### Choosing a shader
 
@@ -149,10 +151,21 @@ live tuner (next section), whose **Shader** menu lists the whole folder.
 
 ### Live preview & tuning
 
-`wrappers/slangfx_live.py` streams a clip — or loops a still image — through an
-effect in a window with one slider per parameter, switches shader/video from a
-menu, and exports the result to H.264 (stills render as a clip of
-`--image-duration` seconds).
+`wrappers/slangfx_live.py` streams a clip — or loops a still image — through a
+**stack of effects (layers)** in a window with one slider per parameter,
+grouped per layer. Add, remove, reorder, or bypass layers from the Layers
+panel (the stack runs as one GPU chain inside a single slangfx process — no
+intermediate readbacks, ~1.6× faster than piping processes at 1080p); switch
+shader/video from a menu; scrub the clip; and export the stacked result to
+H.264 or a single frame to PNG/JPEG (stills render as a clip of
+`--image-duration` seconds). Headless, layers stack by repeating flags:
+
+```bash
+python wrappers/slangfx_live.py -i in.mp4 \
+  --preset shaders/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
+  --preset shaders/chroma-shift/chroma-shift.slangp \
+  --export out.mp4
+```
 
 No Python needed if you use a [release](https://github.com/SteveCastle/slangfx/releases):
 the archive ships a self-contained **`slangfx-live`** executable (Python

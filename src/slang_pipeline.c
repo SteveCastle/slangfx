@@ -235,6 +235,11 @@ struct slang_pipeline {
      * does not supply a frame timestamp (realtime sinks pass real PTS). */
     double   clock_start_ms;
     bool     clock_started;
+
+    /* False when this pipeline borrows another's instance/device (created
+     * via slang_pipeline_create_shared): teardown then skips destroying the
+     * shared Vulkan core objects. */
+    bool     owns_device;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1054,12 +1059,33 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
                                              unsigned output_w, unsigned output_h,
                                              char **err_out)
 {
+    return slang_pipeline_create_shared(preset, input_w, input_h,
+                                        output_w, output_h, NULL, err_out);
+}
+
+struct slang_pipeline *slang_pipeline_create_shared(const struct slangp_preset *preset,
+                                                    unsigned input_w, unsigned input_h,
+                                                    unsigned output_w, unsigned output_h,
+                                                    struct slang_pipeline *share,
+                                                    char **err_out)
+{
     struct slang_pipeline *p = (struct slang_pipeline *)calloc(1, sizeof(*p));
     if (!p) { if (err_out) *err_out = xstrdup("oom"); return NULL; }
     p->input_w = input_w;   p->input_h  = input_h;
     p->output_w = output_w; p->output_h = output_h;
 
-    if (init_instance_and_device(p, err_out) != 0) goto fail;
+    if (share) {
+        p->instance     = share->instance;
+        p->phys         = share->phys;
+        p->dev          = share->dev;
+        p->queue_family = share->queue_family;
+        p->queue        = share->queue;
+        p->mem_props    = share->mem_props;
+        p->owns_device  = false;
+    } else {
+        if (init_instance_and_device(p, err_out) != 0) goto fail;
+        p->owns_device = true;
+    }
 
     /* Shared resources: input image + sampler, staging buffers, vertex/index
      * buffers, UBO, descriptor pool. */
@@ -1443,11 +1469,16 @@ int slang_pipeline_set_param(struct slang_pipeline *p,
     return hits;
 }
 
-int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst,
-                       double time_sec)
+/* Record one pipeline's frame — first-frame feedback init, all passes, and
+ * the end-of-frame feedback snapshots — into `cmd`. Precondition: the
+ * pipeline's input image is populated (staging upload or GPU blit) and in
+ * SHADER_READ_ONLY layout. Postcondition: the final pass image holds the
+ * result, in SHADER_READ_ONLY layout unless the final pass is a feedback
+ * producer (the snapshot pass leaves that one in TRANSFER_SRC; the caller
+ * transitions/reads it either way). */
+static void record_frame(struct slang_pipeline *p, VkCommandBuffer cmd,
+                         double time_sec)
 {
-    if (!p || !src || !dst) return -1;
-
     /* Resolve the `Time` standard field (seconds). A realtime source supplies
      * a real timestamp (PTS) so time-based effects stay correct under pacing
      * and dropped frames; when it is unknown (time_sec < 0, e.g. the untimed
@@ -1459,11 +1490,7 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     }
     float time_val = (float)time_sec;
 
-    /* 1. Upload input. */
-    size_t ubytes = (size_t)p->input_w * p->input_h * 4;
-    memcpy(p->stg_upload_ptr, src, ubytes);
-
-    /* 2. Push constants block (same SourceSize/OutputSize/FrameCount applied
+    /* Push constants block (same SourceSize/OutputSize/FrameCount applied
      *    to all passes for now; per-pass dim-specific values are populated
      *    lazily inside the loop). */
     struct slang_push pc = {0};
@@ -1473,14 +1500,6 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     pc.original_size[3] = 1.0f / (float)p->input_h;
     pc.frame_count      = p->frame_count++;
 
-    /* 3. Record + submit. */
-    vkResetCommandBuffer(p->cmd, 0);
-    VkCommandBufferBeginInfo cbbi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    if (vkBeginCommandBuffer(p->cmd, &cbbi) != VK_SUCCESS) return -2;
-
     /* Phase 6: First-frame feedback initialization. Each producer's
      * feedback image starts in UNDEFINED layout with undefined contents;
      * clear to opaque-black and transition to SHADER_READ_ONLY so the
@@ -1488,36 +1507,20 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
     if (p->frame_count == 1) {
         for (size_t i = 0; i < p->num_passes; ++i) {
             if (!p->passes[i].is_feedback_producer) continue;
-            barrier(p->cmd, p->passes[i].feedback_img,
+            barrier(cmd, p->passes[i].feedback_img,
                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     0, VK_ACCESS_TRANSFER_WRITE_BIT);
             VkClearColorValue cc = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
             VkImageSubresourceRange srr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCmdClearColorImage(p->cmd, p->passes[i].feedback_img,
+            vkCmdClearColorImage(cmd, p->passes[i].feedback_img,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &srr);
-            barrier(p->cmd, p->passes[i].feedback_img,
+            barrier(cmd, p->passes[i].feedback_img,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
     }
-
-    /* Upload to in_img. */
-    barrier(p->cmd, p->in_img,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy bic = {
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { p->input_w, p->input_h, 1 },
-    };
-    vkCmdCopyBufferToImage(p->cmd, p->stg_upload, p->in_img,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-    barrier(p->cmd, p->in_img,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
     /* Iterate passes. */
     uint32_t prev_w = p->input_w, prev_h = p->input_h;
@@ -1705,25 +1708,25 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             .renderArea = { {0,0}, { ps->out_w, ps->out_h } },
             .clearValueCount = 1, .pClearValues = &clear,
         };
-        vkCmdBeginRenderPass(p->cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ps->pipeline);
-        vkCmdBindDescriptorSets(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ps->pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 ps->pipe_layout, 0, 1, &ps->dset, 0, NULL);
         VkDeviceSize off = 0;
-        vkCmdBindVertexBuffers(p->cmd, 0, 1, &p->vbuf, &off);
-        vkCmdBindIndexBuffer(p->cmd, p->ibuf, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdPushConstants(p->cmd, ps->pipe_layout,
+        vkCmdBindVertexBuffers(cmd, 0, 1, &p->vbuf, &off);
+        vkCmdBindIndexBuffer(cmd, p->ibuf, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdPushConstants(cmd, ps->pipe_layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, push_size_used, push_blob);
-        vkCmdDrawIndexed(p->cmd, 6, 1, 0, 0, 0);
-        vkCmdEndRenderPass(p->cmd);
+        vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+        vkCmdEndRenderPass(cmd);
 
         /* Render pass leaves out_img mip 0 in SHADER_READ_ONLY (next
          * pass's Source binding samples it directly). When this pass's
          * output feeds a downstream `mipmap_input` pass, generate the
          * full mip chain via vkCmdBlitImage cascade. */
         if (ps->mip_levels > 1)
-            generate_mipmaps(p->cmd, ps->out_img, ps->out_w, ps->out_h, ps->mip_levels);
+            generate_mipmaps(cmd, ps->out_img, ps->out_w, ps->out_h, ps->mip_levels);
 
         prev_w = ps->out_w; prev_h = ps->out_h;
     }
@@ -1735,11 +1738,11 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         struct pass_state *prod = &p->passes[i];
         if (!prod->is_feedback_producer) continue;
 
-        barrier(p->cmd, prod->out_img,
+        barrier(cmd, prod->out_img,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        barrier(p->cmd, prod->feedback_img,
+        barrier(cmd, prod->feedback_img,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -1749,13 +1752,13 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .extent = { prod->out_w, prod->out_h, 1 },
         };
-        vkCmdCopyImage(p->cmd,
+        vkCmdCopyImage(cmd,
                        prod->out_img,      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        prod->feedback_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &copy);
 
         /* Restore feedback_img to SHADER_READ_ONLY for next frame's reads. */
-        barrier(p->cmd, prod->feedback_img,
+        barrier(cmd, prod->feedback_img,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -1763,55 +1766,133 @@ int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *ds
         /* Restore out_img to SHADER_READ_ONLY (unless it's the last pass —
          * we'll transition that one to TRANSFER_SRC just below for readback). */
         if (i != p->num_passes - 1) {
-            barrier(p->cmd, prod->out_img,
+            barrier(cmd, prod->out_img,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
     }
 
-    /* Last pass output: SHADER_READ_ONLY -> TRANSFER_SRC, copy, restore.
-     * If the last pass was a feedback producer, we already transitioned
-     * its out_img to TRANSFER_SRC above; skip the redundant transition. */
-    struct pass_state *last = &p->passes[p->num_passes - 1];
-    if (!last->is_feedback_producer) {
-        barrier(p->cmd, last->out_img,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+}
+
+int slang_pipeline_run(struct slang_pipeline *p, const uint8_t *src, uint8_t *dst,
+                       double time_sec)
+{
+    return slang_chain_run(&p, 1, src, dst, time_sec);
+}
+
+int slang_chain_run(struct slang_pipeline **pipes, size_t n,
+                    const uint8_t *src, uint8_t *dst, double time_sec)
+{
+    if (!pipes || n == 0 || !src || !dst) return -1;
+    struct slang_pipeline *first = pipes[0];
+    struct slang_pipeline *final = pipes[n - 1];
+    VkCommandBuffer cmd = first->cmd;
+
+    /* 1. Upload input into the first pipeline's staging buffer. */
+    size_t ubytes = (size_t)first->input_w * first->input_h * 4;
+    memcpy(first->stg_upload_ptr, src, ubytes);
+
+    /* 2. Record the whole chain into ONE command buffer: upload, every
+     * pipeline's passes with a GPU-side blit between pipelines, and a single
+     * readback at the end. One submit + one fence per frame regardless of
+     * how many presets are stacked. */
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo cbbi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer(cmd, &cbbi) != VK_SUCCESS) return -2;
+
+    barrier(cmd, first->in_img,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy bic = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { first->input_w, first->input_h, 1 },
+    };
+    vkCmdCopyBufferToImage(cmd, first->stg_upload, first->in_img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    barrier(cmd, first->in_img,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    for (size_t i = 0; i < n; ++i) {
+        record_frame(pipes[i], cmd, time_sec);
+
+        /* This pipeline's final image feeds either the next pipeline (blit)
+         * or the readback; both need TRANSFER_SRC. A feedback-producing
+         * final pass is already there (see record_frame postcondition). */
+        struct pass_state *last = &pipes[i]->passes[pipes[i]->num_passes - 1];
+        if (!last->is_feedback_producer) {
+            barrier(cmd, last->out_img,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        }
+
+        if (i + 1 < n) {
+            /* GPU-side handoff into the next pipeline's input image. Blit
+             * (not copy) so a float-framebuffer final pass converts back to
+             * the RGBA8 input format; extents match, so it is 1:1. */
+            struct slang_pipeline *nx = pipes[i + 1];
+            barrier(cmd, nx->in_img,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkImageBlit blit = {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .srcOffsets = { {0, 0, 0},
+                                { (int32_t)last->out_w, (int32_t)last->out_h, 1 } },
+                .dstOffsets = { {0, 0, 0},
+                                { (int32_t)nx->input_w, (int32_t)nx->input_h, 1 } },
+            };
+            vkCmdBlitImage(cmd,
+                           last->out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           nx->in_img,    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blit, VK_FILTER_NEAREST);
+            barrier(cmd, nx->in_img,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+            /* last->out_img stays TRANSFER_SRC; next frame's render pass
+             * re-initializes it (attachment initialLayout is UNDEFINED). */
+        }
     }
+
+    /* 3. Read back only the final pipeline's output. */
+    struct pass_state *tail = &final->passes[final->num_passes - 1];
     VkBufferImageCopy bic2 = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { last->out_w, last->out_h, 1 },
+        .imageExtent = { tail->out_w, tail->out_h, 1 },
     };
-    vkCmdCopyImageToBuffer(p->cmd, last->out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           p->stg_readback, 1, &bic2);
-    barrier(p->cmd, last->out_img,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT, 0);
+    vkCmdCopyImageToBuffer(cmd, tail->out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           final->stg_readback, 1, &bic2);
 
-    if (vkEndCommandBuffer(p->cmd) != VK_SUCCESS) return -3;
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return -3;
 
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1, .pCommandBuffers = &p->cmd,
+        .commandBufferCount = 1, .pCommandBuffers = &cmd,
     };
-    vkResetFences(p->dev, 1, &p->fence);
-    if (vkQueueSubmit(p->queue, 1, &si, p->fence) != VK_SUCCESS) return -4;
-    vkWaitForFences(p->dev, 1, &p->fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(first->dev, 1, &first->fence);
+    if (vkQueueSubmit(first->queue, 1, &si, first->fence) != VK_SUCCESS) return -4;
+    vkWaitForFences(first->dev, 1, &first->fence, VK_TRUE, UINT64_MAX);
 
     /* 4. Read back. Cached readback memory needs an invalidate so the CPU
      * sees the GPU's just-written bytes (no-op when the type is coherent). */
-    size_t rbytes = (size_t)p->output_w * p->output_h * 4;
-    if (!p->stg_readback_coherent) {
+    size_t rbytes = (size_t)final->output_w * final->output_h * 4;
+    if (!final->stg_readback_coherent) {
         VkMappedMemoryRange range = {
             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-            .memory = p->stg_readback_mem, .offset = 0, .size = VK_WHOLE_SIZE,
+            .memory = final->stg_readback_mem, .offset = 0, .size = VK_WHOLE_SIZE,
         };
-        vkInvalidateMappedMemoryRanges(p->dev, 1, &range);
+        vkInvalidateMappedMemoryRanges(final->dev, 1, &range);
     }
-    memcpy(dst, p->stg_readback_ptr, rbytes);
+    memcpy(dst, final->stg_readback_ptr, rbytes);
     return 0;
 }
 
@@ -1885,8 +1966,10 @@ void slang_pipeline_destroy(struct slang_pipeline *p)
     }
     free(p->ext_textures);
 
-    if (p->dev)          vkDestroyDevice(p->dev, NULL);
-    if (p->instance)     vkDestroyInstance(p->instance, NULL);
+    if (p->owns_device) {
+        if (p->dev)      vkDestroyDevice(p->dev, NULL);
+        if (p->instance) vkDestroyInstance(p->instance, NULL);
+    }
 
     free(p);
 }
