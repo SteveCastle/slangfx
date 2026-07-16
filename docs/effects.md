@@ -59,7 +59,7 @@ you can audition the whole library without relaunching.
 | `bloom` | 4 | Threshold bright-pass (half-res) → separable Gaussian blur → screen-composited back over the clean frame, so highlights bleed soft coloured light. | `threshold`, `radius`, `intensity`, `sat` |
 | `tilt-shift` | 3 | Separable Gaussian blur with a sharp horizontal focus band kept from the clean frame — the miniature/toy "tilt-shift lens" look, with a focus-band saturation pop. | `radius`, `focus` (band y), `band`, `softness`, `pop` |
 | `motion-bloom` | 5 | Bloom keyed to inter-frame **motion**: only moving regions emit the glow, so movement bleeds coloured light while static areas stay sharp. | `sensitivity`, `radius`, `intensity`, `sat` |
-| `soft-crt` | 3 | Subtle analog finishing grade: gentle full-frame soften, highlight bloom, fine scanlines, a contrast lift and animated film grain — every part on its own slider, at 0 that part switches off. | `soften`, `bloom_intensity`, `scan_strength`, `contrast`, `noise_strength` |
+| `soft-crt` | 3 | Subtle analog finishing grade: gentle full-frame soften, highlight bloom, exposure + contrast trim, fine scanlines, corner vignette and animated film grain — every part on its own slider, at 0 (or 1.0 for exposure) that part switches off. | `soften`, `bloom_intensity`, `scan_strength`, `exposure`, `vignette`, `noise_strength` |
 
 ## Motion-reactive
 

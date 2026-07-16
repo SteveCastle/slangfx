@@ -23,14 +23,16 @@ scale_type2    = viewport
 scale2         = 1.0
 wrap_mode2     = clamp_to_edge
 
-parameters = "amount;soften;radius;bloom_threshold;bloom_intensity;contrast;scan_strength;scan_period;noise_strength;noise_size"
+parameters = "amount;soften;radius;bloom_threshold;bloom_intensity;exposure;contrast;scan_strength;scan_period;vignette;noise_strength;noise_size"
 amount          = 1.0
 soften          = 0.25
 radius          = 2.0
 bloom_threshold = 0.6
 bloom_intensity = 0.7
+exposure        = 1.0
 contrast        = 1.15
 scan_strength   = 0.12
 scan_period     = 3.0
+vignette        = 0.25
 noise_strength  = 0.05
 noise_size      = 1.5
