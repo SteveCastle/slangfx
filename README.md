@@ -149,10 +149,20 @@ live tuner (next section), whose **Shader** menu lists the whole folder.
 
 ### Live preview & tuning
 
-`wrappers/slangfx_live.py` streams a clip — or loops a still image — through an
-effect in a window with one slider per parameter, switches shader/video from a
-menu, and exports the result to H.264 (stills render as a clip of
-`--image-duration` seconds).
+`wrappers/slangfx_live.py` streams a clip — or loops a still image — through a
+**stack of effects (layers)** in a window with one slider per parameter,
+grouped per layer. Add, remove, reorder, or bypass layers from the Layers
+panel (each layer is its own slangfx process chained over pipes); switch
+shader/video from a menu; scrub the clip; and export the stacked result to
+H.264 or a single frame to PNG/JPEG (stills render as a clip of
+`--image-duration` seconds). Headless, layers stack by repeating flags:
+
+```bash
+python wrappers/slangfx_live.py -i in.mp4 \
+  --preset shaders/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
+  --preset shaders/chroma-shift/chroma-shift.slangp \
+  --export out.mp4
+```
 
 No Python needed if you use a [release](https://github.com/SteveCastle/slangfx/releases):
 the archive ships a self-contained **`slangfx-live`** executable (Python

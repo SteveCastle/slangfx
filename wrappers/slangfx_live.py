@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """slangfx_live.py — real-time shader-param playground.
 
-Streams a video — or loops a still image — through a slang preset and shows
-the result in a window with one slider per `#pragma parameter`. Dragging a slider sends a live
-`name=value` update to slangfx over UDP (localhost), applied on the next frame
-with no pipeline rebuild. The menu bar switches shader or video on the fly
-(the ffmpeg|slangfx pair is restarted and the sliders rebuilt). Tuned a look
-you like? "Copy params" gives the `k=v,k=v` string for `slangfx --params` /
-`beat_cut --shader-params`, or "Export" renders the current look to an H.264
-file at the source's native resolution/fps with the original audio copied.
-A still image previews as an endless loop (time-based shader animation keeps
-running) and exports as an --image-duration clip at --fps, no audio.
+Streams a video — or loops a still image — through a stack of slang presets
+(layers) and shows the result in a window with one slider per
+`#pragma parameter`, grouped per layer. Dragging a slider sends a live
+`name=value` update to that layer's slangfx over UDP (localhost), applied on
+the next frame with no pipeline rebuild. Layers can be added, removed,
+reordered, and bypassed from the Layers panel; each layer is its own slangfx
+process chained over pipes, so layer N sees layer N-1's output. The menu bar
+switches shader or video on the fly (the chain is restarted and the sliders
+rebuilt). Tuned a look you like? "Copy params" gives per-layer `k=v,k=v`
+strings for `slangfx --params` / `beat_cut --shader-params`, or "Export"
+renders the current stack to an H.264 file at the source's native
+resolution/fps with the original audio copied. A still image previews as an
+endless loop (time-based shader animation keeps running) and exports as an
+--image-duration clip at --fps, no audio.
 
-Pipeline:  ffmpeg (decode+loop+letterbox) -> slangfx (--control-port) -> app
-Controls:  app -> UDP name=value -> slangfx
-Menu:      Shader / Video (quick-pick discovered files + Browse...), Params
+Pipeline:  ffmpeg (decode+loop+letterbox) -> slangfx per layer -> app
+Controls:  app -> UDP name=value -> the layer's control port
+Menu:      Shader (replace / Add layer) / Video / Params / Export
 
 Both -i/--input and --preset are optional: start empty and load them from the
 menus, or pass a video with no preset to play it raw (no shader) until you pick
@@ -173,7 +177,7 @@ def shaders_root_for(args):
     if args.shaders_dir:
         return args.shaders_dir
     if args.preset:
-        return os.path.dirname(os.path.dirname(os.path.abspath(args.preset)))
+        return os.path.dirname(os.path.dirname(os.path.abspath(args.preset[0])))
     # Frozen release layout: shaders/ sits next to the exe. Dev layout: next
     # to wrappers/ (the repo root).
     for bundled in (os.path.join(app_dir(), "shaders"),
@@ -243,17 +247,19 @@ def preview_size(args):
 
 
 class Pipeline:
-    """Feeds letterboxed RGBA frames from one (video, preset) pair. With a
-    preset it's ffmpeg | slangfx (+ a UDP control channel); with preset=None it
-    is ffmpeg alone (raw video, no shader). A reader thread keeps only the
-    latest frame so the UI never blocks (newest-wins; stale frames dropped).
-    Switching video/preset builds a fresh Pipeline."""
+    """Feeds letterboxed RGBA frames from one (video, layer-stack) pair. Each
+    enabled layer is its own slangfx process; layers chain over pipes
+    (ffmpeg | slangfx | slangfx | ...) so layer N's input — including its
+    `Original` — is layer N-1's output. Each layer listens on its own UDP
+    control port. With no layers it's ffmpeg alone (raw video). A reader
+    thread keeps only the latest frame so the UI never blocks (newest-wins).
+    Switching video or restructuring layers builds a fresh Pipeline."""
 
-    def __init__(self, slangfx, ffmpeg, video, preset, w, h, fps, port, params,
+    def __init__(self, slangfx, ffmpeg, video, layers, w, h, fps,
                  realtime=True, start_at=0.0):
         self.w, self.h, self.fb = w, h, w * h * 4
-        self.port = port
-        self.params = params
+        self.layers = [l for l in layers if l.get("enabled", True)]
+        self.procs = []
         self.latest = None
         self.lock = threading.Lock()
         self.paused = False
@@ -287,24 +293,26 @@ class Pipeline:
         ff_cmd += ["-i", video, "-vf", vf,
                    "-f", "rawvideo", "-pix_fmt", "rgba", "-r", str(fps), "-"]
         self.ff = _popen(ff_cmd, stdout=subprocess.PIPE)
+        self.procs.append(self.ff)
 
-        if preset:
-            startup = ",".join(f"{p['name']}={p['default']}" for p in params)
+        src = self.ff.stdout
+        for layer in self.layers:
+            startup = ",".join(f"{p['name']}={p['default']}"
+                               for p in layer["params"])
+            cmd = [slangfx, "--preset", layer["preset"],
+                   "--width", str(w), "--height", str(h),
+                   "--control-port", str(layer["port"]), "--params", startup]
             try:
-                self.sfx = _popen(
-                    [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
-                     "--control-port", str(port), "--params", startup],
-                    stdin=self.ff.stdout, stdout=subprocess.PIPE)
+                proc = _popen(cmd, stdin=src, stdout=subprocess.PIPE)
             except OSError as e:
-                self.ff.terminate()
+                self.close()
                 raise RuntimeError(
                     f"could not run slangfx at '{slangfx}' ({e}) — "
                     "build it or pass --slangfx") from e
-            self.ff.stdout.close()
-            self.src = self.sfx.stdout         # shaded frames
-        else:
-            self.sfx = None
-            self.src = self.ff.stdout          # raw (letterboxed) video frames
+            src.close()                        # child owns the upstream pipe now
+            src = proc.stdout
+            self.procs.append(proc)
+        self.src = src        # last layer's output (or raw video if no layers)
 
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
@@ -337,29 +345,32 @@ class Pipeline:
             return 0.0
         return (self.start_at + self.frames / float(self.fps)) % duration
 
-    def set_param(self, name, value):
-        if self.sfx is None:               # no shader -> nothing to control
+    def set_param(self, port, name, value):
+        """Send a live k=v update to the layer listening on `port`."""
+        if not port or not self.layers:
             return
         try:
-            self.sock.sendto(f"{name}={value}".encode(), ("127.0.0.1", self.port))
+            self.sock.sendto(f"{name}={value}".encode(), ("127.0.0.1", port))
         except OSError:
             pass
 
     def close(self):
         self.running = False
-        procs = [self.ff] if self.sfx is None else [self.sfx, self.ff]
-        for p in procs:
+        for p in reversed(self.procs):
             try:
                 p.terminate()
             except Exception:
                 pass
 
 
-def make_pipeline(args, video, preset, w, h, port, params, realtime=True,
-                  start_at=0.0):
-    return Pipeline(args.slangfx, args.ffmpeg, video, preset,
-                    w, h, args.fps, port, params, realtime=realtime,
-                    start_at=start_at)
+def make_layer(preset, params, enabled=True):
+    return {"preset": os.path.abspath(preset), "params": params,
+            "enabled": enabled, "port": 0}
+
+
+def make_pipeline(args, video, layers, w, h, realtime=True, start_at=0.0):
+    return Pipeline(args.slangfx, args.ffmpeg, video, layers,
+                    w, h, args.fps, realtime=realtime, start_at=start_at)
 
 
 def parse_params_str(s):
@@ -419,17 +430,20 @@ def probe_total_frames(ffmpeg, video):
 class Exporter:
     """Runs a full-resolution export in a background thread and exposes
     pollable state: `progress` (0..1, or <0 if total unknown), `status`, `logs`
-    (list of lines), `done`, `ok`. The shaded path is ffmpeg | slangfx | ffmpeg
-    with `-progress` parsed from the encoder; without a preset it's a single
-    transcode. An image out_path (.png/.jpg/...) renders ONE processed frame —
-    for a video source, the frame at media time `at` (the playhead). Video
-    out_paths copy the original audio; res/fps match the source."""
+    (list of lines), `done`, `ok`. The shaded path chains every layer between
+    decoder and encoder (ffmpeg | slangfx... | ffmpeg) with `-progress` parsed
+    from the encoder; with no layers it's a single transcode. An image
+    out_path (.png/.jpg/...) renders ONE processed frame — for a video source,
+    the frame at media time `at` (the playhead). Video out_paths copy the
+    original audio; res/fps match the source.
 
-    def __init__(self, args, video, preset, params_str, out_path, at=0.0):
+    `layers` is a list of {"preset": path, "params_str": "k=v,..."} applied
+    in order."""
+
+    def __init__(self, args, video, layers, out_path, at=0.0):
         self.args = args
         self.video = video
-        self.preset = preset
-        self.params_str = params_str
+        self.layers = layers or []
         self.out_path = out_path
         self.at = at
         self.image_out = out_path.lower().endswith(IMAGE_EXTS)
@@ -511,9 +525,52 @@ class Exporter:
                 self.status = "export failed (see log)"
             self.done = True
 
+    def _layer_cmds(self, w, h):
+        cmds = []
+        for l in self.layers:
+            c = [self.args.slangfx, "--preset", l["preset"],
+                 "--width", str(w), "--height", str(h)]
+            if l.get("params_str"):
+                c += ["--params", l["params_str"]]
+            cmds.append(c)
+        return cmds
+
+    def _spawn_chain(self, decode, layer_cmds, encode):
+        """decode | layer | layer | ... | encode. `decode` may be None for a
+        single-process transcode (no raw pipe). Returns (threads, waits);
+        threads pump the encoder's -progress plus every process's stderr."""
+        procs, threads = [], []
+        src = None
+        if decode is not None:
+            dec = _popen(decode, stdout=subprocess.PIPE)
+            procs.append(dec)
+            src = dec.stdout
+            for cmd in layer_cmds:
+                mid = _popen(cmd, stdin=src,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                src.close()
+                src = mid.stdout
+                procs.append(mid)
+                threads.append(threading.Thread(
+                    target=self._pump_logs, args=(mid.stderr,), daemon=True))
+        enc = _popen(encode, stdin=src,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if src is not None:
+            src.close()
+        procs.append(enc)
+        threads += [
+            threading.Thread(target=self._pump_progress, args=(enc.stdout,), daemon=True),
+            threading.Thread(target=self._pump_logs, args=(enc.stderr,), daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        return threads, list(reversed(procs))
+
     def _spawn(self):
         a = self.args
         image = is_image(self.video)
+        names = "+".join(os.path.splitext(os.path.basename(l["preset"]))[0]
+                         for l in self.layers) or "no shader"
         if self.image_out:
             # Single processed frame at native resolution. For a video source,
             # seek to the playhead first; a still needs no seek. Image formats
@@ -521,65 +578,36 @@ class Exporter:
             w, h, _ = _probe_wh_fr(a.ffmpeg, self.video)
             seek = ([] if image or self.at <= 0
                     else ["-ss", f"{self.at:.3f}"])
-            self._log(f"export frame {w}x{h} @ {self.at:.2f}s  ->  "
+            self._log(f"export frame {w}x{h} @ {self.at:.2f}s ({names})  ->  "
                       f"{os.path.basename(self.out_path)}")
-            if self.preset:
+            if self.layers:
                 decode = [a.ffmpeg, "-hide_banner", "-loglevel", "error", *seek,
                           "-i", self.video, "-frames:v", "1",
                           "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
-                proc = [a.slangfx, "--preset", self.preset,
-                        "--width", str(w), "--height", str(h)]
-                if self.params_str:
-                    proc += ["--params", self.params_str]
                 encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                           "-progress", "pipe:1", "-nostats",
                           "-f", "rawvideo", "-pix_fmt", "rgba",
                           "-video_size", f"{w}x{h}", "-i", "-",
                           "-frames:v", "1", self.out_path]
-                p1 = _popen(decode, stdout=subprocess.PIPE)
-                p2 = _popen(proc, stdin=p1.stdout,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                p1.stdout.close()
-                p3 = _popen(encode, stdin=p2.stdout,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                p2.stdout.close()
-                threads = [
-                    threading.Thread(target=self._pump_progress, args=(p3.stdout,), daemon=True),
-                    threading.Thread(target=self._pump_logs, args=(p3.stderr,), daemon=True),
-                    threading.Thread(target=self._pump_logs, args=(p2.stderr,), daemon=True),
-                ]
-            else:
-                encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                          "-progress", "pipe:1", "-nostats", *seek,
-                          "-i", self.video, "-frames:v", "1", self.out_path]
-                p1 = _popen(encode, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE)
-                p2 = p3 = None
-                threads = [
-                    threading.Thread(target=self._pump_progress, args=(p1.stdout,), daemon=True),
-                    threading.Thread(target=self._pump_logs, args=(p1.stderr,), daemon=True),
-                ]
-            for t in threads:
-                t.start()
-            waits = [p for p in (p3, p2, p1) if p is not None]
-            return threads, waits
-        if self.preset:
+                return self._spawn_chain(decode, self._layer_cmds(w, h), encode)
+            encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                      "-progress", "pipe:1", "-nostats", *seek,
+                      "-i", self.video, "-frames:v", "1", self.out_path]
+            return self._spawn_chain(None, [], encode)
+        if self.layers:
             w, h, fr = _probe_wh_fr(a.ffmpeg, self.video)
             if image:
                 # A still becomes an --image-duration clip at --fps. yuv420p
                 # needs even dims, so odd images are scaled down 1px.
                 w, h, fr = w - w % 2, h - h % 2, str(a.fps)
-            self._log(f"export {w}x{h} @ {fr}  ->  {os.path.basename(self.out_path)}")
+            self._log(f"export {w}x{h} @ {fr} ({names})  ->  "
+                      f"{os.path.basename(self.out_path)}")
             decode = [a.ffmpeg, "-hide_banner", "-loglevel", "error"]
             if image:
                 decode += ["-loop", "1", "-framerate", fr,
                            "-t", str(a.image_duration)]
             decode += ["-i", self.video, "-vf", f"scale={w}:{h}",
                        "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
-            proc = [a.slangfx, "--preset", self.preset,
-                    "--width", str(w), "--height", str(h)]
-            if self.params_str:
-                proc += ["--params", self.params_str]
             encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                       "-progress", "pipe:1", "-nostats",
                       "-f", "rawvideo", "-pix_fmt", "rgba",
@@ -589,53 +617,33 @@ class Exporter:
                            "-c:a", "copy", "-shortest"]
             encode += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                        "-pix_fmt", "yuv420p", self.out_path]
-            p1 = _popen(decode, stdout=subprocess.PIPE)
-            p2 = _popen(proc, stdin=p1.stdout,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            p1.stdout.close()
-            p3 = _popen(encode, stdin=p2.stdout,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            p2.stdout.close()
-            threads = [
-                threading.Thread(target=self._pump_progress, args=(p3.stdout,), daemon=True),
-                threading.Thread(target=self._pump_logs, args=(p3.stderr,), daemon=True),
-                threading.Thread(target=self._pump_logs, args=(p2.stderr,), daemon=True),
-            ]
+            return self._spawn_chain(decode, self._layer_cmds(w, h), encode)
+        self._log(f"export (no shader)  ->  {os.path.basename(self.out_path)}")
+        encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                  "-progress", "pipe:1", "-nostats"]
+        if image:
+            encode += ["-loop", "1", "-framerate", str(a.fps),
+                       "-t", str(a.image_duration), "-i", self.video,
+                       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
         else:
-            self._log(f"export (no shader)  ->  {os.path.basename(self.out_path)}")
-            encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                      "-progress", "pipe:1", "-nostats"]
-            if image:
-                encode += ["-loop", "1", "-framerate", str(a.fps),
-                           "-t", str(a.image_duration), "-i", self.video,
-                           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
-            else:
-                encode += ["-i", self.video,
-                           "-map", "0:v:0", "-map", "0:a?", "-c:a", "copy"]
-            encode += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                       "-pix_fmt", "yuv420p", self.out_path]
-            p1 = _popen(encode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            p2 = p3 = None
-            threads = [
-                threading.Thread(target=self._pump_progress, args=(p1.stdout,), daemon=True),
-                threading.Thread(target=self._pump_logs, args=(p1.stderr,), daemon=True),
-            ]
-        for t in threads:
-            t.start()
-        waits = [p for p in (p3, p2, p1) if p is not None]
-        return threads, waits
+            encode += ["-i", self.video,
+                       "-map", "0:v:0", "-map", "0:a?", "-c:a", "copy"]
+        encode += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                   "-pix_fmt", "yuv420p", self.out_path]
+        return self._spawn_chain(None, [], encode)
 
 
-def export_video(args, video, preset, params_str, out_path, at=0.0):
+def export_video(args, video, layers, out_path, at=0.0):
     """Blocking export (used by --export). Returns (ok, message)."""
-    ex = Exporter(args, video, preset, params_str, out_path, at=at).start()
+    ex = Exporter(args, video, layers, out_path, at=at).start()
     ex.join()
     return ex.ok, ex.status
 
 
-def default_export_path(video, preset, ext=".mp4"):
+def default_export_path(video, layers, ext=".mp4"):
     base = os.path.splitext(video)[0]
-    tag = os.path.splitext(os.path.basename(preset))[0] if preset else "h264"
+    tag = "+".join(os.path.splitext(os.path.basename(l["preset"]))[0]
+                   for l in layers) or "h264"
     return f"{base}_{tag}{ext}"
 
 
@@ -697,7 +705,7 @@ def install_file_drop(window_title, sink):
 _UNSET = object()   # "argument not provided" sentinel (None is a real value)
 
 
-def run_gui(args, w, h, params):
+def run_gui(args, w, h, layers):
     import dearpygui.dearpygui as dpg
     import numpy as np
 
@@ -706,9 +714,8 @@ def run_gui(args, w, h, params):
 
     state = {
         "video": os.path.abspath(args.input) if args.input else None,
-        "preset": os.path.abspath(args.preset) if args.preset else None,
-        "params": params,
-        "port": args.control_port,
+        "layers": layers,                  # [{preset, params, enabled, port}]
+        "port_next": args.control_port,
         "pipe": None,
         # Scrubbing needs a known length; 0 = unseekable (image / no video).
         "duration": (_probe_duration(args.ffmpeg, os.path.abspath(args.input))
@@ -727,26 +734,47 @@ def run_gui(args, w, h, params):
         return os.path.basename(path) if path else fallback
 
     # --- param controls ---------------------------------------------------
-    def on_slider(sender, value, name):
-        if state["pipe"]:
-            state["pipe"].set_param(name, value)
+    # Slider tags are namespaced per layer (sld_{i}_{name}) because the same
+    # param name (e.g. `amount`) can appear in several layers.
+    def on_slider(sender, value, user_data):
+        i, name = user_data
+        if state["pipe"] and 0 <= i < len(state["layers"]):
+            state["pipe"].set_param(state["layers"][i]["port"], name, value)
+
+    def layer_params_string(i, layer):
+        return ",".join(f"{p['name']}={dpg.get_value(f'sld_{i}_' + p['name']):g}"
+                        for p in layer["params"])
+
+    def snapshot_params():
+        """Fold current slider values into each layer's defaults so a rebuilt
+        pipeline (seek / layer restructure) starts from what you see."""
+        for i, l in enumerate(state["layers"]):
+            for p in l["params"]:
+                tag = f"sld_{i}_" + p["name"]
+                if dpg.does_item_exist(tag):
+                    p["default"] = dpg.get_value(tag)
 
     def copy_params():
-        if not state["params"]:
+        if not state["layers"]:
             dpg.set_value("status", "no shader loaded — nothing to copy")
             return
-        s = ",".join(f"{p['name']}={dpg.get_value('sld_' + p['name']):g}"
-                     for p in state["params"])
+        if len(state["layers"]) == 1:
+            s = layer_params_string(0, state["layers"][0])
+        else:
+            s = "\n".join(
+                f"{os.path.basename(l['preset'])}: {layer_params_string(i, l)}"
+                for i, l in enumerate(state["layers"]))
         dpg.set_clipboard_text(s)
         print("params:", s, flush=True)
         dpg.set_value("status", f"copied: {s}")
 
     def reset_params():
-        for p in state["params"]:
-            dpg.set_value("sld_" + p["name"], p["default"])
-            if state["pipe"]:
-                state["pipe"].set_param(p["name"], p["default"])
-        if state["params"]:
+        for i, l in enumerate(state["layers"]):
+            for p in l["params"]:
+                dpg.set_value(f"sld_{i}_" + p["name"], p["default"])
+                if state["pipe"]:
+                    state["pipe"].set_param(l["port"], p["name"], p["default"])
+        if state["layers"]:
             dpg.set_value("status", "reset to defaults")
 
     def toggle_pause():
@@ -757,10 +785,66 @@ def run_gui(args, w, h, params):
                                label="Play" if p.paused else "Pause")
             dpg.set_value("status", "paused" if p.paused else "running")
 
+    # --- layer stack ------------------------------------------------------
+    def restructure(mutate):
+        """Snapshot sliders, apply a layer-stack mutation, rebuild (keeps the
+        playhead — start() resumes at the current position)."""
+        if state.get("export_view"):
+            dpg.set_value("status", "finish the export (Continue) before editing layers")
+            return
+        snapshot_params()
+        mutate()
+        start()
+
+    def add_layer(path):
+        path = os.path.abspath(path)
+        new_params = discover_params(path)
+        if not new_params:
+            dpg.set_value("status", f"no #pragma params in {os.path.basename(path)}")
+            return
+        restructure(lambda: state["layers"].append(make_layer(path, new_params)))
+
+    def remove_layer(sender, app_data, i):
+        restructure(lambda: state["layers"].pop(i))
+
+    def move_layer(sender, app_data, user_data):
+        i, d = user_data
+        j = i + d
+        if 0 <= j < len(state["layers"]):
+            def swap():
+                ls = state["layers"]
+                ls[i], ls[j] = ls[j], ls[i]
+            restructure(swap)
+
+    def toggle_layer(sender, enabled, i):
+        def flip():
+            state["layers"][i]["enabled"] = enabled
+        restructure(flip)
+
+    def rebuild_layer_list():
+        dpg.delete_item("layers_list", children_only=True)
+        n = len(state["layers"])
+        if not n:
+            dpg.add_text("No layers — use the Shader menu.",
+                         parent="layers_list", color=(170, 170, 170))
+            return
+        for i, l in enumerate(state["layers"]):
+            with dpg.group(horizontal=True, parent="layers_list"):
+                dpg.add_checkbox(default_value=l["enabled"],
+                                 callback=toggle_layer, user_data=i)
+                dpg.add_button(label="^", small=True, enabled=i > 0,
+                               callback=move_layer, user_data=(i, -1))
+                dpg.add_button(label="v", small=True, enabled=i < n - 1,
+                               callback=move_layer, user_data=(i, +1))
+                dpg.add_button(label="x", small=True,
+                               callback=remove_layer, user_data=i)
+                dpg.add_text(f"{i + 1}. {os.path.basename(l['preset'])}"
+                             + ("" if l["enabled"] else "  (off)"))
+
     def rebuild_sliders():
+        rebuild_layer_list()
         dpg.delete_item("sliders", children_only=True)
-        dpg.set_value("preset_label", name_or(state["preset"], "(no shader)"))
-        if not state["params"]:
+        if not state["layers"]:
             # Empty state for the shader controls.
             msg = ("No shader loaded — playing raw video.\n"
                    "Use the Shader menu to add an effect."
@@ -768,20 +852,26 @@ def run_gui(args, w, h, params):
                    "No shader loaded.\nUse the Shader menu to pick one.")
             dpg.add_text(msg, parent="sliders", color=(170, 170, 170), wrap=300)
             return
-        for p in state["params"]:
-            dpg.add_slider_float(
-                parent="sliders", label=p["label"] or p["name"],
-                tag="sld_" + p["name"], default_value=p["default"],
-                min_value=p["min"], max_value=p["max"], callback=on_slider,
-                user_data=p["name"], width=180)
+        for i, l in enumerate(state["layers"]):
+            hdr = dpg.add_collapsing_header(
+                parent="sliders", default_open=l["enabled"],
+                label=f"{i + 1} · {os.path.basename(l['preset'])}"
+                      + ("" if l["enabled"] else "  (off)"))
+            for p in l["params"]:
+                dpg.add_slider_float(
+                    parent=hdr, label=p["label"] or p["name"],
+                    tag=f"sld_{i}_" + p["name"], default_value=p["default"],
+                    min_value=p["min"], max_value=p["max"], callback=on_slider,
+                    user_data=(i, p["name"]), width=170)
 
     def set_blank():
         dpg.set_value("preview_tex", blank)
 
     # --- export -----------------------------------------------------------
-    def current_params_string():
-        return ",".join(f"{p['name']}={dpg.get_value('sld_' + p['name']):g}"
-                        for p in state["params"])
+    def export_layers():
+        """Enabled layers with their current slider values, exporter-shaped."""
+        return [{"preset": l["preset"], "params_str": layer_params_string(i, l)}
+                for i, l in enumerate(state["layers"]) if l["enabled"]]
 
     def start_export(out_path):
         if not state["video"]:
@@ -789,7 +879,7 @@ def run_gui(args, w, h, params):
             return
         if state.get("export_view") or not out_path:
             return
-        params_str = current_params_string()
+        exp_layers = export_layers()
         # Frame exports render the frame under the playhead.
         at = (state["pipe"].position(state["duration"])
               if state["pipe"] and state["duration"] > 0 else 0.0)
@@ -802,8 +892,8 @@ def run_gui(args, w, h, params):
         state["export_view"] = True
         state["export_log_shown"] = 0
         state["export_done_shown"] = False
-        state["exporter"] = Exporter(args, state["video"], state["preset"],
-                                     params_str, out_path, at=at)
+        state["exporter"] = Exporter(args, state["video"], exp_layers,
+                                     out_path, at=at)
         dpg.set_value("export_title", "Exporting  (live playback paused)")
         dpg.set_value("export_bar", 0.0)
         dpg.configure_item("export_bar", overlay="0%")
@@ -828,7 +918,7 @@ def run_gui(args, w, h, params):
         if not state["video"]:
             dpg.set_value("status", "load a video or image before exporting")
             return
-        out = default_export_path(state["video"], state["preset"])
+        out = default_export_path(state["video"], state["layers"])
         dpg.configure_item("dlg_export", default_path=os.path.dirname(out),
                            default_filename=os.path.basename(out))
         dpg.show_item("dlg_export")
@@ -859,17 +949,17 @@ def run_gui(args, w, h, params):
                 _probe_duration(args.ffmpeg, state["video"])
                 if state["video"] and not is_image(state["video"]) else 0.0)
         if preset is not _UNSET:
+            # `preset` replaces the whole stack (single-shader semantics);
+            # add_layer/remove_layer/move_layer edit the stack in place.
             if preset:
                 new_params = discover_params(os.path.abspath(preset))
                 if not new_params:
                     dpg.set_value("status",
                                   f"no #pragma params in {os.path.basename(preset)}")
                     return
-                state["preset"] = os.path.abspath(preset)
-                state["params"] = new_params
+                state["layers"] = [make_layer(preset, new_params)]
             else:
-                state["preset"] = None
-                state["params"] = []
+                state["layers"] = []
 
         if state["pipe"]:
             state["pipe"].close()
@@ -891,12 +981,13 @@ def run_gui(args, w, h, params):
             dpg.set_value("status", "Load a video to begin (Video menu)")
             return
 
-        port = state["port"]
-        state["port"] += 1                     # fresh port avoids any bind race
+        # Fresh ports every rebuild avoid any bind race with the old procs.
+        for l in state["layers"]:
+            l["port"] = state["port_next"]
+            state["port_next"] += 1
         try:
-            state["pipe"] = make_pipeline(args, state["video"], state["preset"],
-                                          w, h, port, state["params"],
-                                          start_at=resume)
+            state["pipe"] = make_pipeline(args, state["video"], state["layers"],
+                                          w, h, start_at=resume)
         except Exception as e:
             state["pipe"] = None
             set_blank()
@@ -904,7 +995,9 @@ def run_gui(args, w, h, params):
             dpg.set_value("status", str(e))
             return
         rebuild_sliders()
-        shader = name_or(state["preset"], "raw video (no shader)")
+        active = [l for l in state["layers"] if l["enabled"]]
+        shader = (" + ".join(os.path.basename(l["preset"]) for l in active)
+                  or "raw video (no shader)")
         dpg.set_value("status", f"{shader}  |  {name_or(state['video'], '')}")
 
     def seek(t):
@@ -913,16 +1006,20 @@ def run_gui(args, w, h, params):
         pipeline starts from them)."""
         if not state["video"] or state.get("export_view") or state["duration"] <= 0:
             return
-        for p in state["params"]:
-            tag = "sld_" + p["name"]
-            if dpg.does_item_exist(tag):
-                p["default"] = dpg.get_value(tag)
+        snapshot_params()
         start(at=max(0.0, min(t, state["duration"] - 0.05)))
 
     def on_pick_shader(sender, app_data):
         f = app_data.get("file_path_name")
         if f and os.path.isfile(f):
-            start(preset=f)
+            if state.pop("browse_add", False):
+                add_layer(f)
+            else:
+                start(preset=f)
+
+    def open_shader_dialog(add=False):
+        state["browse_add"] = add
+        dpg.show_item("dlg_shader")
 
     def on_pick_video(sender, app_data):
         f = app_data.get("file_path_name")
@@ -960,14 +1057,26 @@ def run_gui(args, w, h, params):
                 dpg.add_menu_item(label="(none — raw video)",
                                   callback=lambda: start(preset=None))
                 dpg.add_separator()
+                # Click = replace the stack with this one shader; the "Add
+                # layer" submenu appends instead.
                 for pth in presets:
                     dpg.add_menu_item(
                         label=os.path.basename(pth),
                         callback=lambda s, a, u: start(preset=u), user_data=pth)
                 if presets:
                     dpg.add_separator()
+                with dpg.menu(label="Add layer"):
+                    for pth in presets:
+                        dpg.add_menu_item(
+                            label=os.path.basename(pth),
+                            callback=lambda s, a, u: add_layer(u), user_data=pth)
+                    if presets:
+                        dpg.add_separator()
+                    dpg.add_menu_item(
+                        label="Browse .slangp...",
+                        callback=lambda: open_shader_dialog(add=True))
                 dpg.add_menu_item(label="Browse .slangp...",
-                                  callback=lambda: dpg.show_item("dlg_shader"))
+                                  callback=lambda: open_shader_dialog(add=False))
             with dpg.menu(label="Video"):
                 for pth in videos:
                     dpg.add_menu_item(
@@ -985,12 +1094,12 @@ def run_gui(args, w, h, params):
                 dpg.add_menu_item(
                     label="Export H.264 (next to source)",
                     callback=lambda: start_export(
-                        default_export_path(state["video"], state["preset"])
+                        default_export_path(state["video"], state["layers"])
                         if state["video"] else ""))
                 dpg.add_menu_item(
                     label="Export frame as PNG (at playhead)",
                     callback=lambda: start_export(
-                        default_export_path(state["video"], state["preset"], ".png")
+                        default_export_path(state["video"], state["layers"], ".png")
                         if state["video"] else ""))
                 dpg.add_menu_item(label="Export as...",
                                   callback=open_export_dialog)
@@ -1021,7 +1130,9 @@ def run_gui(args, w, h, params):
                                    tag="export_continue", show=False,
                                    callback=on_continue)
             with dpg.child_window(width=340, autosize_y=True):
-                dpg.add_text("(no shader)", tag="preset_label")
+                dpg.add_text("Layers")
+                dpg.add_child_window(tag="layers_list", autosize_x=True,
+                                     height=108)
                 dpg.add_separator()
                 dpg.add_child_window(tag="sliders", autosize_x=True, height=-64)
                 dpg.add_separator()
@@ -1138,14 +1249,15 @@ def _verify_live_control(pipe, deadline):
     """amount=0 is an exact passthrough (static); amount=1 is the full effect.
     Returns (d_static, d_change): static baseline drift and the change the live
     update produced. Isolates the UDP update from the shader's own animation."""
+    port = pipe.layers[0]["port"]
     _wait_frames(pipe, 5, deadline)          # wait until slangfx is listening
-    pipe.set_param("speed", 0.0)
-    pipe.set_param("amount", 0.0)
+    pipe.set_param(port, "speed", 0.0)
+    pipe.set_param(port, "amount", 0.0)
     _wait_frames(pipe, 30, deadline)
     a = pipe.get_latest()
     _wait_frames(pipe, 8, deadline)
     a2 = pipe.get_latest()
-    pipe.set_param("amount", 1.0)
+    pipe.set_param(port, "amount", 1.0)
     _wait_frames(pipe, 12, deadline)
     b = pipe.get_latest()
     if not all(x is not None for x in (a, a2, b)):
@@ -1153,14 +1265,21 @@ def _verify_live_control(pipe, deadline):
     return _l1(a, a2), _l1(a, b)
 
 
-def run_selftest(args, w, h, params):
+def run_selftest(args, w, h, layers):
     if not os.path.isfile(args.slangfx):
         print(f"SELFTEST FAIL: slangfx not found at {args.slangfx}"); return 2
 
-    # 1) Live control on the launch preset. (realtime=False: run unpaced so the
-    # test finishes fast — the GUI uses realtime pacing.)
-    pipe = make_pipeline(args, args.input, args.preset, w, h, args.control_port,
-                         params, realtime=False)
+    def with_ports(ls, base):
+        for i, l in enumerate(ls):
+            l["port"] = base + i
+        return ls
+
+    # 1) Live control on the first launch preset. (realtime=False: run unpaced
+    # so the test finishes fast — the GUI uses realtime pacing.)
+    params = layers[0]["params"]
+    pipe = make_pipeline(args, args.input,
+                         with_ports([dict(layers[0])], args.control_port),
+                         w, h, realtime=False)
     d_static, d_change = (None, None)
     if any(p["name"] == "amount" for p in params):
         d_static, d_change = _verify_live_control(pipe, time.time() + 25)
@@ -1177,14 +1296,17 @@ def run_selftest(args, w, h, params):
         print("    live control: skipped (no 'amount' param)")
 
     # 2) Switch to a different preset and confirm frames flow + params change.
+    launch = os.path.abspath(layers[0]["preset"])
     others = [p for p in find_presets(shaders_root_for(args))
-              if os.path.abspath(p) != os.path.abspath(args.preset)]
+              if os.path.abspath(p) != launch]
     switch_ok = True
     if others:
         p2 = others[0]
         params2 = discover_params(p2)
-        pipe2 = make_pipeline(args, args.input, p2, w, h, args.control_port + 1,
-                              params2, realtime=False)
+        pipe2 = make_pipeline(args, args.input,
+                              with_ports([make_layer(p2, params2)],
+                                         args.control_port + 10),
+                              w, h, realtime=False)
         _wait_frames(pipe2, 12, time.time() + 20)
         switch_ok = pipe2.frames >= 10 and bool(params2)
         print(f"[2] switched -> {os.path.basename(p2)}: frames {pipe2.frames}, "
@@ -1193,7 +1315,24 @@ def run_selftest(args, w, h, params):
     else:
         print("[2] switch: skipped (no other presets discovered)")
 
-    ok = ctrl_ok and switch_ok
+    # 3) Two-layer chain: launch preset + another, frames must flow and layer
+    # 2's live control must act on the CHAINED output.
+    chain_ok = True
+    if others:
+        p2 = others[0]
+        stack = with_ports([dict(layers[0]), make_layer(p2, discover_params(p2))],
+                           args.control_port + 20)
+        pipe3 = make_pipeline(args, args.input, stack, w, h, realtime=False)
+        _wait_frames(pipe3, 12, time.time() + 25)
+        chain_ok = pipe3.frames >= 10
+        print(f"[3] 2-layer chain ({os.path.basename(launch)} -> "
+              f"{os.path.basename(p2)}): frames {pipe3.frames} -> "
+              f"{'OK' if chain_ok else 'FAIL'}")
+        pipe3.close()
+    else:
+        print("[3] chain: skipped (no other presets discovered)")
+
+    ok = ctrl_ok and switch_ok and chain_ok
     print("SELFTEST PASS" if ok else "SELFTEST FAIL")
     return 0 if ok else 1
 
@@ -1223,8 +1362,9 @@ def main():
     ap.add_argument("-i", "--input", default=None,
                     help="Video/image to stream. Optional — load one from the "
                          "Video menu in the UI.")
-    ap.add_argument("--preset", default=None,
-                    help="Path to a .slangp preset. Optional — load one from the "
+    ap.add_argument("--preset", action="append", default=None,
+                    help="Path to a .slangp preset. Repeatable — each one is a "
+                         "layer, applied in order. Optional: load from the "
                          "Shader menu in the UI; without one the video plays raw.")
     ap.add_argument("--shaders-dir", default=None,
                     help="Directory scanned to populate the Shader menu "
@@ -1232,14 +1372,16 @@ def main():
     ap.add_argument("--videos-dir", default=None,
                     help="Directory scanned to populate the Video menu "
                          "(default: the --input's folder, else cwd).")
-    ap.add_argument("--params", default=None,
+    ap.add_argument("--params", action="append", default=None,
                     help="Initial 'k=v,k=v' param overrides (seed the sliders; "
-                         "also used by --export).")
+                         "also used by --export). Repeatable: the Nth --params "
+                         "applies to the Nth --preset.")
     ap.add_argument("--export", default=None, metavar="OUT",
-                    help="Headless: render --input through --preset (with "
-                         "--params) and exit. A video OUT gets H.264 with the "
-                         "original audio at source res/fps; an image OUT "
-                         "(.png/.jpg/...) gets the single frame at --at.")
+                    help="Headless: render --input through the --preset layer "
+                         "stack (with --params) and exit. A video OUT gets "
+                         "H.264 with the original audio at source res/fps; an "
+                         "image OUT (.png/.jpg/...) gets the single frame at "
+                         "--at.")
     ap.add_argument("--at", type=float, default=0.0,
                     help="Media time (s) of the frame for image exports "
                          "(default 0).")
@@ -1257,39 +1399,46 @@ def main():
                          "Requires --input and --preset.")
     args = ap.parse_args()
 
-    if args.preset and not os.path.isfile(args.preset):
-        sys.exit(f"preset not found: {args.preset}")
     if args.input and not os.path.isfile(args.input):
         sys.exit(f"input not found: {args.input}")
-    params = discover_params(args.preset) if args.preset else []
-    if args.preset and not params:
-        sys.exit(f"no #pragma parameters found in {args.preset}")
 
-    # Seed slider defaults from --params so launch overrides are reflected.
-    if args.params and params:
-        ov = parse_params_str(args.params)
+    # Build the launch layer stack: one layer per --preset, in order, with the
+    # matching --params entry (if any) folded into that layer's defaults.
+    params_cli = args.params or []
+    layers = []
+    for i, pth in enumerate(args.preset or []):
+        if not os.path.isfile(pth):
+            sys.exit(f"preset not found: {pth}")
+        params = discover_params(pth)
+        if not params:
+            sys.exit(f"no #pragma parameters found in {pth}")
+        ov = parse_params_str(params_cli[i]) if i < len(params_cli) else {}
         for p in params:
             if p["name"] in ov:
                 p["default"] = ov[p["name"]]
+        layers.append(make_layer(pth, params))
 
     if args.export:
         if not args.input:
             sys.exit("--export requires --input")
-        ok, msg = export_video(
-            args, os.path.abspath(args.input),
-            os.path.abspath(args.preset) if args.preset else None,
-            args.params, os.path.abspath(args.export), at=args.at)
+        exp_layers = [
+            {"preset": l["preset"],
+             "params_str": ",".join(f"{p['name']}={p['default']:g}"
+                                    for p in l["params"])}
+            for l in layers]
+        ok, msg = export_video(args, os.path.abspath(args.input), exp_layers,
+                               os.path.abspath(args.export), at=args.at)
         print(msg)
         sys.exit(0 if ok else 1)
 
     if args.selftest:
-        if not args.input or not args.preset:
+        if not args.input or not layers:
             sys.exit("--selftest requires both --input and --preset")
         w, h = preview_size(args)
-        sys.exit(run_selftest(args, w, h, params))
+        sys.exit(run_selftest(args, w, h, layers))
 
     w, h = preview_size(args)
-    run_gui(args, w, h, params)
+    run_gui(args, w, h, layers)
 
 
 if __name__ == "__main__":
