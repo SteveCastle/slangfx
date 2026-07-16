@@ -43,10 +43,18 @@ jobs:
       - name: Test
         run: meson test -C build --print-errorlogs
 
+      - name: Bundle slangfx-live (PyInstaller)
+        run: |
+          python3 -m pip install --user pyinstaller -r wrappers/requirements.txt
+          python3 -m PyInstaller --onefile --name slangfx-live \
+            --distpath dist-live --workpath build-pyi --specpath build-pyi \
+            wrappers/slangfx_live.py
+
       - name: Package
         run: |
           mkdir -p pkg/slangfx
           cp build/slangfx pkg/slangfx/
+          cp dist-live/slangfx-live pkg/slangfx/
           cp -r shaders wrappers pkg/slangfx/
           cp README.md LICENSE pkg/slangfx/
           tar -C pkg -czf slangfx-linux-x86_64.tar.gz slangfx
@@ -118,11 +126,20 @@ jobs:
       - name: Test
         run: meson test -C build --print-errorlogs
 
+      - name: Bundle slangfx-live (PyInstaller)
+        shell: pwsh
+        run: |
+          python -m pip install pyinstaller -r wrappers/requirements.txt
+          python -m PyInstaller --onefile --noconsole --name slangfx-live `
+            --distpath dist-live --workpath build-pyi --specpath build-pyi `
+            wrappers/slangfx_live.py
+
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force pkg\slangfx | Out-Null
           Copy-Item build\slangfx.exe pkg\slangfx\
+          Copy-Item dist-live\slangfx-live.exe pkg\slangfx\
           Copy-Item "$env:VULKAN_SDK\Bin\shaderc_shared.dll" pkg\slangfx\
           Copy-Item -Recurse shaders pkg\slangfx\shaders
           Copy-Item -Recurse wrappers pkg\slangfx\wrappers

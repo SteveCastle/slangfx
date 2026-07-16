@@ -152,11 +152,20 @@ live tuner (next section), whose **Shader** menu lists the whole folder.
 `wrappers/slangfx_live.py` streams a clip — or loops a still image — through an
 effect in a window with one slider per parameter, switches shader/video from a
 menu, and exports the result to H.264 (stills render as a clip of
-`--image-duration` seconds). See [Usage → Live parameter tuner](https://SteveCastle.github.io/slangfx/usage.html).
+`--image-duration` seconds).
+
+No Python needed if you use a [release](https://github.com/SteveCastle/slangfx/releases):
+the archive ships a self-contained **`slangfx-live`** executable (Python
+runtime bundled) next to `slangfx` and `shaders/` — just run it (ffmpeg on
+PATH is still required). See [Usage → Live parameter tuner](https://SteveCastle.github.io/slangfx/usage.html).
 
 ```bash
-python -m pip install -r wrappers/requirements.txt
-python wrappers/slangfx_live.py            # start empty; load a clip + effect from the menus
+# One-time: a dedicated environment for the wrapper tools
+python -m venv .venv
+.venv/Scripts/python -m pip install -r wrappers/requirements.txt   # Windows
+# .venv/bin/python -m pip install -r wrappers/requirements.txt     # Linux/macOS
+
+.venv/Scripts/python wrappers/slangfx_live.py   # start empty; load a clip + effect from the menus
 ```
 
 ### Tuning shader parameters
