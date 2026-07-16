@@ -2,13 +2,18 @@
 build/
 builddir/
 .muon/
-
+.venv
 # Generated SPIR-V (we ship sources, not artifacts)
 *.spv
 
-# Python wrapper caches
+# Python wrapper caches + local env
 __pycache__/
 *.pyc
+.venv/
+
+# PyInstaller output (slangfx-live bundle)
+build-pyi/
+dist-live/
 
 # Editor / IDE
 .vscode/

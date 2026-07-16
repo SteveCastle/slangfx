@@ -132,14 +132,14 @@ Some shaders depend on features not yet implemented — see
 
 slangfx also ships its own library of original effects under [`shaders/`](shaders/)
 — colour grading, edge detection, blurs, blooms, motion-reactive feedback,
-tempo-synced beats, and glitch/analog looks (24 presets). They follow the same
+tempo-synced beats, and glitch/analog looks (25 presets). They follow the same
 `.slangp` format, so they run anywhere a libretro preset does:
 
 ```bash
 python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/bloom/bloom.slangp -o out.mp4
 ```
 
-A few to try: `bloom`, `sobel-neon`, `thermal`, `chroma-shift`, `kaleidoscope`,
+A few to try: `bloom`, `soft-crt`, `sobel-neon`, `thermal`, `chroma-shift`, `kaleidoscope`,
 `tilt-shift`, `motion-trails`, `perlin-flow`, `voronoi-shatter`. Most expose an
 `amount` (0 = passthrough) plus tunable sliders. See the full catalogue with
 descriptions and parameters in
@@ -149,13 +149,23 @@ live tuner (next section), whose **Shader** menu lists the whole folder.
 
 ### Live preview & tuning
 
-`wrappers/slangfx_live.py` streams a clip through an effect in a window with one
-slider per parameter, switches shader/video from a menu, and exports the result
-to H.264. See [Usage → Live parameter tuner](https://SteveCastle.github.io/slangfx/usage.html).
+`wrappers/slangfx_live.py` streams a clip — or loops a still image — through an
+effect in a window with one slider per parameter, switches shader/video from a
+menu, and exports the result to H.264 (stills render as a clip of
+`--image-duration` seconds).
+
+No Python needed if you use a [release](https://github.com/SteveCastle/slangfx/releases):
+the archive ships a self-contained **`slangfx-live`** executable (Python
+runtime bundled) next to `slangfx` and `shaders/` — just run it (ffmpeg on
+PATH is still required). See [Usage → Live parameter tuner](https://SteveCastle.github.io/slangfx/usage.html).
 
 ```bash
-python -m pip install -r wrappers/requirements.txt
-python wrappers/slangfx_live.py            # start empty; load a clip + effect from the menus
+# One-time: a dedicated environment for the wrapper tools
+python -m venv .venv
+.venv/Scripts/python -m pip install -r wrappers/requirements.txt   # Windows
+# .venv/bin/python -m pip install -r wrappers/requirements.txt     # Linux/macOS
+
+.venv/Scripts/python wrappers/slangfx_live.py   # start empty; load a clip + effect from the menus
 ```
 
 ### Tuning shader parameters
