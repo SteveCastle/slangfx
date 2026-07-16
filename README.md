@@ -111,7 +111,9 @@ ffmpeg -i in.mp4 -f rawvideo -pix_fmt rgba - \
           -i in.mp4 -map 0:v -map 1:a -c:v libx264 -c:a copy out.mp4
 ```
 
-`slangfx --help` prints the full option list.
+`slangfx --help` prints the full option list. `--preset` is repeatable — each
+one is a layer, applied in order and chained on the GPU with no intermediate
+readback (a following `--params` binds to the preset before it).
 
 ### Choosing a shader
 
@@ -152,7 +154,8 @@ live tuner (next section), whose **Shader** menu lists the whole folder.
 `wrappers/slangfx_live.py` streams a clip — or loops a still image — through a
 **stack of effects (layers)** in a window with one slider per parameter,
 grouped per layer. Add, remove, reorder, or bypass layers from the Layers
-panel (each layer is its own slangfx process chained over pipes); switch
+panel (the stack runs as one GPU chain inside a single slangfx process — no
+intermediate readbacks, ~1.6× faster than piping processes at 1080p); switch
 shader/video from a menu; scrub the clip; and export the stacked result to
 H.264 or a single frame to PNG/JPEG (stills render as a clip of
 `--image-duration` seconds). Headless, layers stack by repeating flags:

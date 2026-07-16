@@ -4,10 +4,11 @@
 Streams a video — or loops a still image — through a stack of slang presets
 (layers) and shows the result in a window with one slider per
 `#pragma parameter`, grouped per layer. Dragging a slider sends a live
-`name=value` update to that layer's slangfx over UDP (localhost), applied on
-the next frame with no pipeline rebuild. Layers can be added, removed,
-reordered, and bypassed from the Layers panel; each layer is its own slangfx
-process chained over pipes, so layer N sees layer N-1's output. The menu bar
+`name=value` update to that layer over UDP (localhost), applied on the next
+frame with no pipeline rebuild. Layers can be added, removed, reordered, and
+bypassed from the Layers panel; the whole stack runs inside ONE slangfx
+process, chained on the GPU (layer N sees layer N-1's output, no intermediate
+readback — fast enough for realtime streaming). The menu bar
 switches shader or video on the fly (the chain is restarted and the sliders
 rebuilt). Tuned a look you like? "Copy params" gives per-layer `k=v,k=v`
 strings for `slangfx --params` / `beat_cut --shader-params`, or "Export"
@@ -247,18 +248,20 @@ def preview_size(args):
 
 
 class Pipeline:
-    """Feeds letterboxed RGBA frames from one (video, layer-stack) pair. Each
-    enabled layer is its own slangfx process; layers chain over pipes
-    (ffmpeg | slangfx | slangfx | ...) so layer N's input — including its
-    `Original` — is layer N-1's output. Each layer listens on its own UDP
-    control port. With no layers it's ffmpeg alone (raw video). A reader
-    thread keeps only the latest frame so the UI never blocks (newest-wins).
-    Switching video or restructuring layers builds a fresh Pipeline."""
+    """Feeds letterboxed RGBA frames from one (video, layer-stack) pair. All
+    enabled layers run inside ONE slangfx process (repeated --preset flags)
+    chained on the GPU — layer N's input, including its `Original`, is layer
+    N-1's output, with no intermediate readback. Live updates go to a single
+    UDP control port; 'i:name=value' routes to layer i. With no layers it's
+    ffmpeg alone (raw video). A reader thread keeps only the latest frame so
+    the UI never blocks (newest-wins). Switching video or restructuring
+    layers builds a fresh Pipeline."""
 
-    def __init__(self, slangfx, ffmpeg, video, layers, w, h, fps,
+    def __init__(self, slangfx, ffmpeg, video, layers, w, h, fps, port,
                  realtime=True, start_at=0.0):
         self.w, self.h, self.fb = w, h, w * h * 4
         self.layers = [l for l in layers if l.get("enabled", True)]
+        self.port = port
         self.procs = []
         self.latest = None
         self.lock = threading.Lock()
@@ -296,12 +299,16 @@ class Pipeline:
         self.procs.append(self.ff)
 
         src = self.ff.stdout
-        for layer in self.layers:
-            startup = ",".join(f"{p['name']}={p['default']}"
-                               for p in layer["params"])
-            cmd = [slangfx, "--preset", layer["preset"],
-                   "--width", str(w), "--height", str(h),
-                   "--control-port", str(layer["port"]), "--params", startup]
+        if self.layers:
+            cmd = [slangfx]
+            for layer in self.layers:
+                cmd += ["--preset", layer["preset"]]
+                startup = ",".join(f"{p['name']}={p['default']}"
+                                   for p in layer["params"])
+                if startup:
+                    cmd += ["--params", startup]
+            cmd += ["--width", str(w), "--height", str(h),
+                    "--control-port", str(port)]
             try:
                 proc = _popen(cmd, stdin=src, stdout=subprocess.PIPE)
             except OSError as e:
@@ -312,7 +319,7 @@ class Pipeline:
             src.close()                        # child owns the upstream pipe now
             src = proc.stdout
             self.procs.append(proc)
-        self.src = src        # last layer's output (or raw video if no layers)
+        self.src = src        # shaded output (or raw video if no layers)
 
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
@@ -345,12 +352,16 @@ class Pipeline:
             return 0.0
         return (self.start_at + self.frames / float(self.fps)) % duration
 
-    def set_param(self, port, name, value):
-        """Send a live k=v update to the layer listening on `port`."""
-        if not port or not self.layers:
+    def set_param(self, layer, name, value):
+        """Send a live k=v update routed to `layer` ('i:name=value' protocol,
+        where i is the layer's position among the ENABLED layers in the
+        chain). No-op for layers not in the chain (disabled)."""
+        idx = next((i for i, l in enumerate(self.layers) if l is layer), None)
+        if idx is None:
             return
         try:
-            self.sock.sendto(f"{name}={value}".encode(), ("127.0.0.1", port))
+            self.sock.sendto(f"{idx}:{name}={value}".encode(),
+                             ("127.0.0.1", self.port))
         except OSError:
             pass
 
@@ -365,12 +376,14 @@ class Pipeline:
 
 def make_layer(preset, params, enabled=True):
     return {"preset": os.path.abspath(preset), "params": params,
-            "enabled": enabled, "port": 0}
+            "enabled": enabled}
 
 
-def make_pipeline(args, video, layers, w, h, realtime=True, start_at=0.0):
+def make_pipeline(args, video, layers, w, h, port, realtime=True,
+                  start_at=0.0):
     return Pipeline(args.slangfx, args.ffmpeg, video, layers,
-                    w, h, args.fps, realtime=realtime, start_at=start_at)
+                    w, h, args.fps, port, realtime=realtime,
+                    start_at=start_at)
 
 
 def parse_params_str(s):
@@ -526,14 +539,17 @@ class Exporter:
             self.done = True
 
     def _layer_cmds(self, w, h):
-        cmds = []
+        """One slangfx invocation carrying the whole stack — layers chain on
+        the GPU inside the process (repeated --preset flags)."""
+        if not self.layers:
+            return []
+        c = [self.args.slangfx]
         for l in self.layers:
-            c = [self.args.slangfx, "--preset", l["preset"],
-                 "--width", str(w), "--height", str(h)]
+            c += ["--preset", l["preset"]]
             if l.get("params_str"):
                 c += ["--params", l["params_str"]]
-            cmds.append(c)
-        return cmds
+        c += ["--width", str(w), "--height", str(h)]
+        return [c]
 
     def _spawn_chain(self, decode, layer_cmds, encode):
         """decode | layer | layer | ... | encode. `decode` may be None for a
@@ -739,7 +755,7 @@ def run_gui(args, w, h, layers):
     def on_slider(sender, value, user_data):
         i, name = user_data
         if state["pipe"] and 0 <= i < len(state["layers"]):
-            state["pipe"].set_param(state["layers"][i]["port"], name, value)
+            state["pipe"].set_param(state["layers"][i], name, value)
 
     def layer_params_string(i, layer):
         return ",".join(f"{p['name']}={dpg.get_value(f'sld_{i}_' + p['name']):g}"
@@ -773,7 +789,7 @@ def run_gui(args, w, h, layers):
             for p in l["params"]:
                 dpg.set_value(f"sld_{i}_" + p["name"], p["default"])
                 if state["pipe"]:
-                    state["pipe"].set_param(l["port"], p["name"], p["default"])
+                    state["pipe"].set_param(l, p["name"], p["default"])
         if state["layers"]:
             dpg.set_value("status", "reset to defaults")
 
@@ -981,13 +997,12 @@ def run_gui(args, w, h, layers):
             dpg.set_value("status", "Load a video to begin (Video menu)")
             return
 
-        # Fresh ports every rebuild avoid any bind race with the old procs.
-        for l in state["layers"]:
-            l["port"] = state["port_next"]
-            state["port_next"] += 1
+        # A fresh port every rebuild avoids any bind race with the old proc.
+        port = state["port_next"]
+        state["port_next"] += 1
         try:
             state["pipe"] = make_pipeline(args, state["video"], state["layers"],
-                                          w, h, start_at=resume)
+                                          w, h, port, start_at=resume)
         except Exception as e:
             state["pipe"] = None
             set_blank()
@@ -1249,15 +1264,15 @@ def _verify_live_control(pipe, deadline):
     """amount=0 is an exact passthrough (static); amount=1 is the full effect.
     Returns (d_static, d_change): static baseline drift and the change the live
     update produced. Isolates the UDP update from the shader's own animation."""
-    port = pipe.layers[0]["port"]
+    layer0 = pipe.layers[0]
     _wait_frames(pipe, 5, deadline)          # wait until slangfx is listening
-    pipe.set_param(port, "speed", 0.0)
-    pipe.set_param(port, "amount", 0.0)
+    pipe.set_param(layer0, "speed", 0.0)
+    pipe.set_param(layer0, "amount", 0.0)
     _wait_frames(pipe, 30, deadline)
     a = pipe.get_latest()
     _wait_frames(pipe, 8, deadline)
     a2 = pipe.get_latest()
-    pipe.set_param(port, "amount", 1.0)
+    pipe.set_param(layer0, "amount", 1.0)
     _wait_frames(pipe, 12, deadline)
     b = pipe.get_latest()
     if not all(x is not None for x in (a, a2, b)):
@@ -1269,17 +1284,11 @@ def run_selftest(args, w, h, layers):
     if not os.path.isfile(args.slangfx):
         print(f"SELFTEST FAIL: slangfx not found at {args.slangfx}"); return 2
 
-    def with_ports(ls, base):
-        for i, l in enumerate(ls):
-            l["port"] = base + i
-        return ls
-
     # 1) Live control on the first launch preset. (realtime=False: run unpaced
     # so the test finishes fast — the GUI uses realtime pacing.)
     params = layers[0]["params"]
-    pipe = make_pipeline(args, args.input,
-                         with_ports([dict(layers[0])], args.control_port),
-                         w, h, realtime=False)
+    pipe = make_pipeline(args, args.input, [dict(layers[0])],
+                         w, h, args.control_port, realtime=False)
     d_static, d_change = (None, None)
     if any(p["name"] == "amount" for p in params):
         d_static, d_change = _verify_live_control(pipe, time.time() + 25)
@@ -1303,10 +1312,8 @@ def run_selftest(args, w, h, layers):
     if others:
         p2 = others[0]
         params2 = discover_params(p2)
-        pipe2 = make_pipeline(args, args.input,
-                              with_ports([make_layer(p2, params2)],
-                                         args.control_port + 10),
-                              w, h, realtime=False)
+        pipe2 = make_pipeline(args, args.input, [make_layer(p2, params2)],
+                              w, h, args.control_port + 10, realtime=False)
         _wait_frames(pipe2, 12, time.time() + 20)
         switch_ok = pipe2.frames >= 10 and bool(params2)
         print(f"[2] switched -> {os.path.basename(p2)}: frames {pipe2.frames}, "
@@ -1320,9 +1327,9 @@ def run_selftest(args, w, h, layers):
     chain_ok = True
     if others:
         p2 = others[0]
-        stack = with_ports([dict(layers[0]), make_layer(p2, discover_params(p2))],
-                           args.control_port + 20)
-        pipe3 = make_pipeline(args, args.input, stack, w, h, realtime=False)
+        stack = [dict(layers[0]), make_layer(p2, discover_params(p2))]
+        pipe3 = make_pipeline(args, args.input, stack, w, h,
+                              args.control_port + 20, realtime=False)
         _wait_frames(pipe3, 12, time.time() + 25)
         chain_ok = pipe3.frames >= 10
         print(f"[3] 2-layer chain ({os.path.basename(launch)} -> "

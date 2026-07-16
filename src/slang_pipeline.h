@@ -42,6 +42,26 @@ struct slang_pipeline *slang_pipeline_create(const struct slangp_preset *preset,
                                              unsigned output_w, unsigned output_h,
                                              char **err_out);
 
+/* Like slang_pipeline_create, but reuse `share`'s Vulkan instance/device/
+ * queue instead of creating fresh ones. Pipelines that share a device can be
+ * chained on the GPU via slang_chain_run (no intermediate readback). The
+ * shared device is destroyed only when the owning (share == NULL) pipeline
+ * is destroyed — destroy sharers first. */
+struct slang_pipeline *slang_pipeline_create_shared(const struct slangp_preset *preset,
+                                                    unsigned input_w, unsigned input_h,
+                                                    unsigned output_w, unsigned output_h,
+                                                    struct slang_pipeline *share,
+                                                    char **err_out);
+
+/* Run `n` pipelines as one GPU chain over a single frame: upload once into
+ * pipes[0], blit each pipeline's final image into the next pipeline's input
+ * on the GPU, read back only pipes[n-1]. One command buffer, one submit, one
+ * fence — no intermediate CPU transfers. All pipelines must share a device
+ * (created via slang_pipeline_create_shared against pipes[0]) and have equal
+ * frame dimensions. n == 1 is exactly slang_pipeline_run. */
+int slang_chain_run(struct slang_pipeline **pipes, size_t n,
+                    const uint8_t *src, uint8_t *dst, double time_sec);
+
 /* Apply the pipeline to one frame. Input and output buffers are CPU-side
  * BGRA8 / RGBA8 (Phase 1); Phase 9 adds zero-copy Vulkan AVFrame paths.
  *
