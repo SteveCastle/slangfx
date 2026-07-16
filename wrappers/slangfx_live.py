@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """slangfx_live.py — real-time shader-param playground.
 
-Streams a video through a slang preset and shows the result in a window with
-one slider per `#pragma parameter`. Dragging a slider sends a live
+Streams a video — or loops a still image — through a slang preset and shows
+the result in a window with one slider per `#pragma parameter`. Dragging a slider sends a live
 `name=value` update to slangfx over UDP (localhost), applied on the next frame
 with no pipeline rebuild. The menu bar switches shader or video on the fly
 (the ffmpeg|slangfx pair is restarted and the sliders rebuilt). Tuned a look
 you like? "Copy params" gives the `k=v,k=v` string for `slangfx --params` /
 `beat_cut --shader-params`, or "Export" renders the current look to an H.264
 file at the source's native resolution/fps with the original audio copied.
+A still image previews as an endless loop (time-based shader animation keeps
+running) and exports as an --image-duration clip at --fps, no audio.
 
 Pipeline:  ffmpeg (decode+loop+letterbox) -> slangfx (--control-port) -> app
 Controls:  app -> UDP name=value -> slangfx
@@ -40,6 +42,12 @@ import threading
 import time
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".gif")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
+MEDIA_EXTS = VIDEO_EXTS + IMAGE_EXTS
+
+
+def is_image(path):
+    return bool(path) and path.lower().endswith(IMAGE_EXTS)
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +128,8 @@ def find_presets(root):
 
 
 def find_videos(root):
-    """Videos directly in `root`, sorted. Empty if root is missing/None."""
+    """Videos and images directly in `root`, sorted. Empty if root is
+    missing/None."""
     if not root or not os.path.isdir(root):
         return []
     try:
@@ -128,7 +137,7 @@ def find_videos(root):
     except OSError:
         return []
     return sorted(os.path.join(root, f) for f in names
-                  if f.lower().endswith(VIDEO_EXTS))
+                  if f.lower().endswith(MEDIA_EXTS))
 
 
 def shaders_root_for(args):
@@ -212,7 +221,15 @@ class Pipeline:
         # `-re` paces ffmpeg to the source's native frame rate (real time);
         # without it ffmpeg floods the pipe and the preview plays many times too
         # fast. Off for the self-test, where we want frames as fast as possible.
-        ff_cmd = [ffmpeg, "-loglevel", "error", "-stream_loop", "-1"]
+        ff_cmd = [ffmpeg, "-loglevel", "error"]
+        if is_image(video):
+            # Still image: the image2 demuxer's `-loop 1` repeats the single
+            # frame forever (`-stream_loop` doesn't loop stills), and
+            # `-framerate` gives `-re` a native rate to pace against. Time-based
+            # shader animation keeps running because frames keep flowing.
+            ff_cmd += ["-loop", "1", "-framerate", str(fps)]
+        else:
+            ff_cmd += ["-stream_loop", "-1"]
         if realtime:
             ff_cmd += ["-re"]
         ff_cmd += ["-i", video, "-vf", vf,
@@ -221,10 +238,16 @@ class Pipeline:
 
         if preset:
             startup = ",".join(f"{p['name']}={p['default']}" for p in params)
-            self.sfx = subprocess.Popen(
-                [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
-                 "--control-port", str(port), "--params", startup],
-                stdin=self.ff.stdout, stdout=subprocess.PIPE)
+            try:
+                self.sfx = subprocess.Popen(
+                    [slangfx, "--preset", preset, "--width", str(w), "--height", str(h),
+                     "--control-port", str(port), "--params", startup],
+                    stdin=self.ff.stdout, stdout=subprocess.PIPE)
+            except OSError as e:
+                self.ff.terminate()
+                raise RuntimeError(
+                    f"could not run slangfx at '{slangfx}' ({e}) — "
+                    "build it or pass --slangfx") from e
             self.ff.stdout.close()
             self.src = self.sfx.stdout         # shaded frames
         else:
@@ -393,7 +416,10 @@ class Exporter:
 
     def _run(self):
         try:
-            self.total = probe_total_frames(self.args.ffmpeg, self.video)
+            if is_image(self.video):
+                self.total = int(round(self.args.fps * self.args.image_duration))
+            else:
+                self.total = probe_total_frames(self.args.ffmpeg, self.video)
             threads, waits = self._spawn()
             for t in threads:
                 t.join()
@@ -415,11 +441,20 @@ class Exporter:
 
     def _spawn(self):
         a = self.args
+        image = is_image(self.video)
         if self.preset:
             w, h, fr = _probe_wh_fr(a.ffmpeg, self.video)
+            if image:
+                # A still becomes an --image-duration clip at --fps. yuv420p
+                # needs even dims, so odd images are scaled down 1px.
+                w, h, fr = w - w % 2, h - h % 2, str(a.fps)
             self._log(f"export {w}x{h} @ {fr}  ->  {os.path.basename(self.out_path)}")
-            decode = [a.ffmpeg, "-hide_banner", "-loglevel", "error",
-                      "-i", self.video, "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+            decode = [a.ffmpeg, "-hide_banner", "-loglevel", "error"]
+            if image:
+                decode += ["-loop", "1", "-framerate", fr,
+                           "-t", str(a.image_duration)]
+            decode += ["-i", self.video, "-vf", f"scale={w}:{h}",
+                       "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
             proc = [a.slangfx, "--preset", self.preset,
                     "--width", str(w), "--height", str(h)]
             if self.params_str:
@@ -427,11 +462,12 @@ class Exporter:
             encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                       "-progress", "pipe:1", "-nostats",
                       "-f", "rawvideo", "-pix_fmt", "rgba",
-                      "-video_size", f"{w}x{h}", "-framerate", fr, "-i", "-",
-                      "-i", self.video, "-map", "0:v", "-map", "1:a?",
-                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                      "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest",
-                      self.out_path]
+                      "-video_size", f"{w}x{h}", "-framerate", fr, "-i", "-"]
+            if not image:
+                encode += ["-i", self.video, "-map", "0:v", "-map", "1:a?",
+                           "-c:a", "copy", "-shortest"]
+            encode += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                       "-pix_fmt", "yuv420p", self.out_path]
             p1 = subprocess.Popen(decode, stdout=subprocess.PIPE)
             p2 = subprocess.Popen(proc, stdin=p1.stdout,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -447,10 +483,16 @@ class Exporter:
         else:
             self._log(f"export (no shader)  ->  {os.path.basename(self.out_path)}")
             encode = [a.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                      "-progress", "pipe:1", "-nostats", "-i", self.video,
-                      "-map", "0:v:0", "-map", "0:a?",
-                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                      "-pix_fmt", "yuv420p", "-c:a", "copy", self.out_path]
+                      "-progress", "pipe:1", "-nostats"]
+            if image:
+                encode += ["-loop", "1", "-framerate", str(a.fps),
+                           "-t", str(a.image_duration), "-i", self.video,
+                           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+            else:
+                encode += ["-i", self.video,
+                           "-map", "0:v:0", "-map", "0:a?", "-c:a", "copy"]
+            encode += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                       "-pix_fmt", "yuv420p", self.out_path]
             p1 = subprocess.Popen(encode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             p2 = p3 = None
             threads = [
@@ -565,7 +607,7 @@ def run_gui(args, w, h, params):
 
     def start_export(out_path):
         if not state["video"]:
-            dpg.set_value("status", "load a video before exporting")
+            dpg.set_value("status", "load a video or image before exporting")
             return
         if state.get("export_view") or not out_path:
             return
@@ -601,7 +643,7 @@ def run_gui(args, w, h, params):
 
     def open_export_dialog():
         if not state["video"]:
-            dpg.set_value("status", "load a video before exporting")
+            dpg.set_value("status", "load a video or image before exporting")
             return
         out = default_export_path(state["video"], state["preset"])
         dpg.configure_item("dlg_export", default_path=os.path.dirname(out),
@@ -648,8 +690,15 @@ def run_gui(args, w, h, params):
 
         port = state["port"]
         state["port"] += 1                     # fresh port avoids any bind race
-        state["pipe"] = make_pipeline(args, state["video"], state["preset"],
-                                      w, h, port, state["params"])
+        try:
+            state["pipe"] = make_pipeline(args, state["video"], state["preset"],
+                                          w, h, port, state["params"])
+        except Exception as e:
+            state["pipe"] = None
+            set_blank()
+            rebuild_sliders()
+            dpg.set_value("status", str(e))
+            return
         rebuild_sliders()
         shader = name_or(state["preset"], "raw video (no shader)")
         dpg.set_value("status", f"{shader}  |  {name_or(state['video'], '')}")
@@ -675,6 +724,9 @@ def run_gui(args, w, h, params):
         dpg.add_file_extension("Video files (*.mp4 *.mov *.mkv *.webm){"
                                ".mp4,.mov,.mkv,.webm,.avi,.m4v,.gif}",
                                color=(120, 255, 160))
+        dpg.add_file_extension("Image files (*.png *.jpg *.webp){"
+                               ".png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff}",
+                               color=(255, 220, 120))
         dpg.add_file_extension(".*")
     with dpg.file_dialog(directory_selector=False, show=False, modal=True,
                          callback=on_export_pick, tag="dlg_export",
@@ -704,7 +756,7 @@ def run_gui(args, w, h, params):
                         callback=lambda s, a, u: start(video=u), user_data=pth)
                 if videos:
                     dpg.add_separator()
-                dpg.add_menu_item(label="Browse video...",
+                dpg.add_menu_item(label="Browse video/image...",
                                   callback=lambda: dpg.show_item("dlg_video"))
             with dpg.menu(label="Params"):
                 dpg.add_menu_item(label="Copy params", callback=copy_params)
@@ -874,6 +926,21 @@ def run_selftest(args, w, h, params):
     return 0 if ok else 1
 
 
+def default_slangfx(here):
+    """Prefer the repo's built binary. PATH lookup is the fallback and must be
+    vetted: on Windows shutil.which() searches the cwd and honors PATHEXT, so
+    which("slangfx") run from wrappers/ happily returns slangfx.py — which then
+    dies at spawn time with WinError 193 (not a valid Win32 application)."""
+    for cand in (os.path.join(here, "..", "build", "slangfx.exe"),
+                 os.path.join(here, "..", "build", "slangfx")):
+        if os.path.isfile(cand):
+            return os.path.normpath(cand)
+    found = shutil.which("slangfx")
+    if found and not found.lower().endswith((".py", ".pyc")):
+        return found
+    return "slangfx"
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__,
@@ -897,12 +964,14 @@ def main():
                     help="Headless: render --input through --preset (with "
                          "--params) to an H.264 file (original audio + res/fps) "
                          "and exit.")
+    ap.add_argument("--image-duration", type=float, default=10.0,
+                    help="Clip length (seconds) when exporting a still image "
+                         "(default 10). The preview loops a still forever.")
     ap.add_argument("--width", type=int, default=0, help="Preview width (px).")
     ap.add_argument("--height", type=int, default=0, help="Preview height (px).")
     ap.add_argument("--fps", type=int, default=30, help="Preview frame rate.")
     ap.add_argument("--control-port", type=int, default=9000)
-    ap.add_argument("--slangfx", default=shutil.which("slangfx") or
-                    os.path.join(here, "..", "build", "slangfx.exe"))
+    ap.add_argument("--slangfx", default=default_slangfx(here))
     ap.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
     ap.add_argument("--selftest", action="store_true",
                     help="Run headless; verify live control and a shader switch. "
