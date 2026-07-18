@@ -25,8 +25,37 @@ npm run serve                    # → http://localhost:8788/web/demo/
 ```
 
 Open the URL in Chrome/Edge 113+ (any browser with WebGPU), drop in a video
-or image, and stack effects from the **Add layer…** menu. Sliders update
-live with no rebuild; PNG frame export and WebM recording are built in.
+or image, and stack effects from the **Add layer…** menu — effects are
+grouped into collapsible category folders (mirroring the
+`shaders/<category>/` layout), and typing in the search box collapses
+everything into a flat filtered list (matches on effect or category name;
+Enter adds the first hit). Sliders update live with no rebuild; PNG frame
+export and WebM recording are built in.
+
+### Write your own shader in the browser
+
+**Add layer… → ✎ custom shader** creates a layer backed by a code editor
+instead of a file: it starts from a boilerplate slang shader, and
+**Compile** rebuilds just that layer in-place (line-numbered GLSL errors
+show inline; the last working version keeps running until a compile
+succeeds). A custom layer chains, reorders, and bypasses like any other.
+
+Tunables use a one-line sugar — each declares the uniform *and* its UI
+slider, referenced by bare name in the code:
+
+```glsl
+//@param wobble "Wobble (px)" 6.0 0.0 64.0 0.5
+...
+uv.x += sin(uv.y * 24.0) * wobble * params.SourceSize.z;
+```
+
+(`//@param` is expanded by the preprocessor into a `#pragma parameter` plus
+a push-constant member and works in regular `.slang` files too; classic
+`#pragma parameter` + explicit block members remain fully supported.)
+
+**Save** stores the shader under a name in the browser's localStorage;
+saved shaders reappear in the **Add layer…** menu (🗎) across sessions, and
+**Forget** deletes one.
 
 Run the offline compile test (no browser needed — the same wasm toolchain
 runs under Node):
@@ -109,8 +138,8 @@ const fx = await SlangFx.create({
 });
 
 await fx.setSourceSize(video.videoWidth, video.videoHeight);
-await fx.addLayer('shaders/soft-crt/soft-crt.slangp');
-await fx.addLayer('shaders/motion-trails/motion-trails.slangp');
+await fx.addLayer('shaders/blur-bloom/soft-crt/soft-crt.slangp');
+await fx.addLayer('shaders/motion/motion-trails/motion-trails.slangp');
 fx.setParam(0, 'scan_strength', 0.3);              // live, no rebuild
 
 (function tick() {

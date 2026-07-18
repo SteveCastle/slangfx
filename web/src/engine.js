@@ -647,11 +647,21 @@ export class SlangFx {
     return this.moduleCache.get(key);
   }
 
-  /** Append a layer from a .slangp path. Returns its index. */
-  async addLayer(presetPath) {
-    this.layers.push({ path: presetPath, enabled: true, runtime: null, error: null, savedParams: null });
+  /** Append a layer from a .slangp path. Returns its index.
+   * `label` overrides the display name in getLayerInfo (useful for layers
+   * backed by virtual/in-memory files, e.g. a live shader editor). */
+  async addLayer(presetPath, { label = null } = {}) {
+    this.layers.push({ path: presetPath, label, enabled: true, runtime: null, error: null, savedParams: null });
     await this.rebuild();
     return this.layers.length - 1;
+  }
+
+  /** Drop cached compiled modules whose source path starts with `prefix`.
+   * Call before rebuild() when the backing source text has changed (live
+   * shader editing) — the cache is keyed by path and would stay stale. */
+  invalidateModules(prefix) {
+    for (const key of [...this.moduleCache.keys()])
+      if (key.startsWith(prefix)) this.moduleCache.delete(key);
   }
 
   async removeLayer(i) { this.layers.splice(i, 1); await this.rebuild(); }
@@ -713,7 +723,7 @@ export class SlangFx {
     return this.layers.map((layer, i) => ({
       index: i,
       path: layer.path,
-      name: layer.path.split('/').pop(),
+      name: layer.label ?? layer.path.split('/').pop(),
       enabled: layer.enabled,
       error: layer.error,
       params: layer.runtime

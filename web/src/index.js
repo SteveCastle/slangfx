@@ -12,7 +12,7 @@
  *     readFile: async (p) => (await fetch('/' + p)).text(),
  *   });
  *   await fx.setSourceSize(video.videoWidth, video.videoHeight);
- *   await fx.addLayer('shaders/soft-crt/soft-crt.slangp');
+ *   await fx.addLayer('shaders/blur-bloom/soft-crt/soft-crt.slangp');
  *   fx.setParam(0, 'scan_strength', 0.3);
  *   const tick = () => { fx.render(video, video.currentTime); requestAnimationFrame(tick); };
  *   tick();

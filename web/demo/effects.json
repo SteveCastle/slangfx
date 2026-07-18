@@ -1,152 +1,219 @@
 {
+  "categories": [
+    {
+      "id": "adjust",
+      "label": "Adjust"
+    },
+    {
+      "id": "color",
+      "label": "Colour & tone"
+    },
+    {
+      "id": "edges",
+      "label": "Edge detection"
+    },
+    {
+      "id": "blur-bloom",
+      "label": "Blur & bloom"
+    },
+    {
+      "id": "motion",
+      "label": "Motion-reactive"
+    },
+    {
+      "id": "beat",
+      "label": "Tempo-synced"
+    },
+    {
+      "id": "glitch",
+      "label": "Glitch & analog"
+    }
+  ],
   "effects": [
     {
-      "name": "beat-glitch",
-      "path": "shaders/beat-glitch/beat-glitch.slangp"
-    },
-    {
-      "name": "beat-kaleido",
-      "path": "shaders/beat-kaleido/beat-kaleido.slangp"
-    },
-    {
-      "name": "beat-strobe",
-      "path": "shaders/beat-strobe/beat-strobe.slangp"
-    },
-    {
-      "name": "bloom",
-      "path": "shaders/bloom/bloom.slangp"
-    },
-    {
-      "name": "chroma-shift",
-      "path": "shaders/chroma-shift/chroma-shift.slangp"
-    },
-    {
-      "name": "datamosh",
-      "path": "shaders/datamosh/datamosh.slangp"
-    },
-    {
-      "name": "datamosh_skin",
-      "path": "shaders/datamosh-skin/datamosh_skin.slangp"
-    },
-    {
-      "name": "duotone",
-      "path": "shaders/duotone/duotone.slangp"
-    },
-    {
       "name": "exposure",
-      "path": "shaders/exposure/exposure.slangp"
-    },
-    {
-      "name": "feedback-echo",
-      "path": "shaders/feedback-echo/feedback-echo.slangp"
+      "path": "shaders/adjust/exposure/exposure.slangp",
+      "category": "adjust"
     },
     {
       "name": "gaussian-blur",
-      "path": "shaders/gaussian-blur/gaussian-blur.slangp"
+      "path": "shaders/adjust/gaussian-blur/gaussian-blur.slangp",
+      "category": "adjust"
     },
     {
       "name": "grain",
-      "path": "shaders/grain/grain.slangp"
-    },
-    {
-      "name": "halftone",
-      "path": "shaders/halftone/halftone.slangp"
-    },
-    {
-      "name": "kaleidoscope",
-      "path": "shaders/kaleidoscope/kaleidoscope.slangp"
+      "path": "shaders/adjust/grain/grain.slangp",
+      "category": "adjust"
     },
     {
       "name": "levels",
-      "path": "shaders/levels/levels.slangp"
+      "path": "shaders/adjust/levels/levels.slangp",
+      "category": "adjust"
     },
     {
       "name": "mono",
-      "path": "shaders/mono/mono.slangp"
-    },
-    {
-      "name": "motion-bloom",
-      "path": "shaders/motion-bloom/motion-bloom.slangp"
-    },
-    {
-      "name": "motion-pulse",
-      "path": "shaders/motion-pulse/motion-pulse.slangp"
-    },
-    {
-      "name": "motion-shatter",
-      "path": "shaders/motion-shatter/motion-shatter.slangp"
-    },
-    {
-      "name": "motion-trails",
-      "path": "shaders/motion-trails/motion-trails.slangp"
-    },
-    {
-      "name": "perlin-flow",
-      "path": "shaders/perlin-flow/perlin-flow.slangp"
+      "path": "shaders/adjust/mono/mono.slangp",
+      "category": "adjust"
     },
     {
       "name": "pixelate",
-      "path": "shaders/pixelate/pixelate.slangp"
-    },
-    {
-      "name": "pixelsort",
-      "path": "shaders/pixelsort/pixelsort.slangp"
-    },
-    {
-      "name": "posterize-pop",
-      "path": "shaders/posterize-pop/posterize-pop.slangp"
+      "path": "shaders/adjust/pixelate/pixelate.slangp",
+      "category": "adjust"
     },
     {
       "name": "saturation",
-      "path": "shaders/saturation/saturation.slangp"
-    },
-    {
-      "name": "scrambled-crt",
-      "path": "shaders/scrambled-crt/scrambled-crt.slangp"
+      "path": "shaders/adjust/saturation/saturation.slangp",
+      "category": "adjust"
     },
     {
       "name": "sharpen",
-      "path": "shaders/sharpen/sharpen.slangp"
-    },
-    {
-      "name": "slice-glitch",
-      "path": "shaders/slice-glitch/slice-glitch.slangp"
-    },
-    {
-      "name": "sobel-neon",
-      "path": "shaders/sobel-neon/sobel-neon.slangp"
-    },
-    {
-      "name": "soft-crt",
-      "path": "shaders/soft-crt/soft-crt.slangp"
+      "path": "shaders/adjust/sharpen/sharpen.slangp",
+      "category": "adjust"
     },
     {
       "name": "split-tone",
-      "path": "shaders/split-tone/split-tone.slangp"
+      "path": "shaders/adjust/split-tone/split-tone.slangp",
+      "category": "adjust"
     },
     {
       "name": "temperature",
-      "path": "shaders/temperature/temperature.slangp"
-    },
-    {
-      "name": "thermal",
-      "path": "shaders/thermal/thermal.slangp"
-    },
-    {
-      "name": "tilt-shift",
-      "path": "shaders/tilt-shift/tilt-shift.slangp"
+      "path": "shaders/adjust/temperature/temperature.slangp",
+      "category": "adjust"
     },
     {
       "name": "transform",
-      "path": "shaders/transform/transform.slangp"
+      "path": "shaders/adjust/transform/transform.slangp",
+      "category": "adjust"
     },
     {
       "name": "vignette",
-      "path": "shaders/vignette/vignette.slangp"
+      "path": "shaders/adjust/vignette/vignette.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "beat-glitch",
+      "path": "shaders/beat/beat-glitch/beat-glitch.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "beat-kaleido",
+      "path": "shaders/beat/beat-kaleido/beat-kaleido.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "beat-strobe",
+      "path": "shaders/beat/beat-strobe/beat-strobe.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "bloom",
+      "path": "shaders/blur-bloom/bloom/bloom.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "motion-bloom",
+      "path": "shaders/blur-bloom/motion-bloom/motion-bloom.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "soft-crt",
+      "path": "shaders/blur-bloom/soft-crt/soft-crt.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "tilt-shift",
+      "path": "shaders/blur-bloom/tilt-shift/tilt-shift.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "chroma-shift",
+      "path": "shaders/color/chroma-shift/chroma-shift.slangp",
+      "category": "color"
+    },
+    {
+      "name": "duotone",
+      "path": "shaders/color/duotone/duotone.slangp",
+      "category": "color"
+    },
+    {
+      "name": "halftone",
+      "path": "shaders/color/halftone/halftone.slangp",
+      "category": "color"
+    },
+    {
+      "name": "kaleidoscope",
+      "path": "shaders/color/kaleidoscope/kaleidoscope.slangp",
+      "category": "color"
+    },
+    {
+      "name": "posterize-pop",
+      "path": "shaders/color/posterize-pop/posterize-pop.slangp",
+      "category": "color"
+    },
+    {
+      "name": "thermal",
+      "path": "shaders/color/thermal/thermal.slangp",
+      "category": "color"
+    },
+    {
+      "name": "sobel-neon",
+      "path": "shaders/edges/sobel-neon/sobel-neon.slangp",
+      "category": "edges"
+    },
+    {
+      "name": "datamosh",
+      "path": "shaders/glitch/datamosh/datamosh.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "datamosh_skin",
+      "path": "shaders/glitch/datamosh-skin/datamosh_skin.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "feedback-echo",
+      "path": "shaders/glitch/feedback-echo/feedback-echo.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "pixelsort",
+      "path": "shaders/glitch/pixelsort/pixelsort.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "scrambled-crt",
+      "path": "shaders/glitch/scrambled-crt/scrambled-crt.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "slice-glitch",
+      "path": "shaders/glitch/slice-glitch/slice-glitch.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "motion-pulse",
+      "path": "shaders/motion/motion-pulse/motion-pulse.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "motion-shatter",
+      "path": "shaders/motion/motion-shatter/motion-shatter.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "motion-trails",
+      "path": "shaders/motion/motion-trails/motion-trails.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "perlin-flow",
+      "path": "shaders/motion/perlin-flow/perlin-flow.slangp",
+      "category": "motion"
     },
     {
       "name": "voronoi-shatter",
-      "path": "shaders/voronoi-shatter/voronoi-shatter.slangp"
+      "path": "shaders/motion/voronoi-shatter/voronoi-shatter.slangp",
+      "category": "motion"
     }
   ]
 }

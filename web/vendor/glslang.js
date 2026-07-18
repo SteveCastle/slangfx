@@ -58,6 +58,18 @@ if (typeof exports === 'object' && typeof module === 'object')
                     const i = import.meta.url.lastIndexOf('/')
                     return import.meta.url.substring(0, i) + '/glslang.wasm';
                 },
+                // slangfx patch: mirror compiler diagnostics into a global
+                // buffer so callers can attach line-numbered GLSL errors to
+                // thrown exceptions (emscripten binds console fns at init,
+                // so they cannot be intercepted afterwards).
+                print(text) {
+                    (globalThis.__slangfxGlslangLog ??= []).push(text);
+                    console.log(text);
+                },
+                printErr(text) {
+                    (globalThis.__slangfxGlslangLog ??= []).push(text);
+                    console.warn(text);
+                },
                 onRuntimeInitialized() {
                     resolve({
                         compileGLSLZeroCopy: this.compileGLSLZeroCopy,

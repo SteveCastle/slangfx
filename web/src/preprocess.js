@@ -106,6 +106,38 @@ const TEXTURE_BUILTINS =
   'texelFetch|texelFetchOffset|textureSize|textureGather|textureGatherOffset|' +
   'textureQueryLod|textureQueryLevels';
 
+/* `//@param NAME "Label" DEFAULT MIN MAX STEP` — one-line sugar that
+ * declares a tunable float and its UI slider together. Each line expands to
+ * a `#pragma parameter` (→ slider metadata), a `float NAME;` member
+ * injected into the shader's push_constant block (or an auto-generated one
+ * when the shader has none), and a `#define NAME <block>.NAME` so the body
+ * references it bare. Everything after the expansion is plain libretro
+ * slang, so the sugar works in .slang files and hand-written editor
+ * shaders alike. */
+function expandAutoParams(src) {
+  const names = [];
+  let text = src.replace(/^[ \t]*\/\/@param[ \t]+(\w+)[ \t]*(.*?)[ \t]*\r?$/gm, (all, name, rest) => {
+    names.push(name);
+    return `#pragma parameter ${name} ${rest || `"${name}" 0.5 0.0 1.0 0.01`}`;
+  });
+  if (!names.length) return text;
+
+  const members = names.map((n) => `    float ${n};`).join('\n');
+  const pushBlock = /(layout\s*\(\s*push_constant\s*\)\s*uniform\s+\w+\s*\{)([^}]*)(\}\s*(\w+)\s*;)/;
+  const m = text.match(pushBlock);
+  if (m) {
+    const defines = names.map((n) => `#define ${n} ${m[4]}.${n}`).join('\n');
+    text = text.replace(pushBlock, (all, open, body, close) =>
+      `${open}${body}\n${members}\n${close}\n${defines}\n`);
+  } else {
+    const block =
+      `layout(push_constant) uniform SlangfxAutoParams\n{\n${members}\n} slangfx_auto_;\n` +
+      names.map((n) => `#define ${n} slangfx_auto_.${n}`).join('\n') + '\n';
+    text = text.replace(/^([ \t]*#version[^\n]*\n)/, `$1${block}`);
+  }
+  return text;
+}
+
 /* Apply the WebGPU rewrites to the full (flattened) source, BEFORE stage
  * splitting so sampler slot numbering is consistent across stages.
  *
@@ -122,7 +154,8 @@ const TEXTURE_BUILTINS =
  *
  * Returns the rewritten text plus the discovered sampler table. */
 function rewriteForWebGPU(src) {
-  let text = src.replace(RESERVED_RE, '$1_sfx');
+  let text = expandAutoParams(src);
+  text = text.replace(RESERVED_RE, '$1_sfx');
   text = text.replace(
     /layout\s*\(\s*push_constant\s*\)\s*uniform/g,
     'layout(std140, set = 1, binding = 0) uniform'

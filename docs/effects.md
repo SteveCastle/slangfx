@@ -21,13 +21,13 @@ folder.
 ```bash
 # Batch-render a clip to a file (native res/fps, audio copied):
 python wrappers/slangfx.py -i my_clip.mp4 \
-  --preset shaders/bloom/bloom.slangp -o out.mp4
+  --preset shaders/blur-bloom/bloom/bloom.slangp -o out.mp4
 
 # Tune it live with sliders (and switch effects / export from the menus):
-python wrappers/slangfx_live.py -i my_clip.mp4 --preset shaders/bloom/bloom.slangp
+python wrappers/slangfx_live.py -i my_clip.mp4 --preset shaders/blur-bloom/bloom/bloom.slangp
 
 # Override any parameter (comma-separated name=value):
-python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/thermal/thermal.slangp \
+python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/color/thermal/thermal.slangp \
   --params "contrast=1.8,outline=1.2" -o out.mp4
 ```
 
@@ -66,6 +66,7 @@ keep `amount = 0` as an exact passthrough.
 | `duotone` | 1 | Two-tone print: maps luma onto a gradient between a shadow hue and a highlight hue, plus crawling film grain. | `shadow_hue`, `light_hue`, `contrast`, `grain` |
 | `posterize-pop` | 1 | Comic / cel look: quantises colour into a few flat bands, boosts saturation, and inks a black Sobel outline around shapes. | `levels`, `sat`, `outline`, `thickness` |
 | `kaleidoscope` | 1 | Folds the frame into N mirrored wedges around the centre, slowly rotating the mirror and cycling the hue. | `segments`, `zoom`, `spin`, `hue_speed` |
+| `halftone` | 1 | Print-style halftone: luma-sized dots on a rotated screen grid. | `dot_size`, `angle`, `sharp` |
 
 ## Edge detection
 
@@ -123,7 +124,10 @@ with `beat_cut.py` for cut-locked visuals.
 ## Authoring notes
 
 - Each effect is self-contained in its folder (`<name>.slang` + `<name>.slangp`,
-  plus any helper passes). Copy a folder as a starting template.
+  plus any helper passes). Copy a folder as a starting template. Effects are
+  grouped into category folders — `shaders/<category>/<effect>/` — matching
+  the sections on this page (`adjust`, `color`, `edges`, `blur-bloom`,
+  `motion`, `beat`, `glitch`).
 - The standard push-constant fields (`SourceSize`, `OriginalSize`, `OutputSize`,
   `FrameCount`) and the realtime `Time` field are available; see
   [slang format]({{ '/slang_format.html' | relative_url }}).

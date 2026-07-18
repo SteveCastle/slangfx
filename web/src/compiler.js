@@ -37,17 +37,21 @@ export async function compileSlang(source, { path = '<inline>', readFile, glslan
     );
   }
 
-  let vertSpv, fragSpv;
-  try {
-    vertSpv = glslang.compileGLSL(pre.vertexGlsl, 'vertex', true);
-  } catch (e) {
-    throw new Error(`${path}: vertex compile failed: ${e.message || e}`);
-  }
-  try {
-    fragSpv = glslang.compileGLSL(pre.fragmentGlsl, 'fragment', true);
-  } catch (e) {
-    throw new Error(`${path}: fragment compile failed: ${e.message || e}`);
-  }
+  // glslang.wasm reports its useful diagnostics (line-numbered GLSL errors)
+  // through console.error/warn, not the thrown exception. Capture them so
+  // editor UIs can show the real message.
+  const compileStage = (glsl, stage) => {
+    if (globalThis.__slangfxGlslangLog) globalThis.__slangfxGlslangLog.length = 0;
+    try {
+      return glslang.compileGLSL(glsl, stage, true);
+    } catch (e) {
+      const log = globalThis.__slangfxGlslangLog ?? [];
+      const detail = log.filter((l) => /error/i.test(l)).join('\n') || log.join('\n');
+      throw new Error(`${path}: ${stage} compile failed: ${detail || e.message || e}`);
+    }
+  };
+  const vertSpv = compileStage(pre.vertexGlsl, 'vertex');
+  const fragSpv = compileStage(pre.fragmentGlsl, 'fragment');
 
   // Reflect the fragment stage (slang contract: both stages share the same
   // block declarations; fragment is reliably present). Merge in the vertex

@@ -141,7 +141,7 @@ stacking as layers (37 presets). They follow the same
 `.slangp` format, so they run anywhere a libretro preset does:
 
 ```bash
-python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/bloom/bloom.slangp -o out.mp4
+python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/blur-bloom/bloom/bloom.slangp -o out.mp4
 ```
 
 A few to try: `bloom`, `soft-crt`, `sobel-neon`, `thermal`, `chroma-shift`, `kaleidoscope`,
@@ -165,8 +165,8 @@ H.264 or a single frame to PNG/JPEG (stills render as a clip of
 
 ```bash
 python wrappers/slangfx_live.py -i in.mp4 \
-  --preset shaders/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
-  --preset shaders/chroma-shift/chroma-shift.slangp \
+  --preset shaders/blur-bloom/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
+  --preset shaders/color/chroma-shift/chroma-shift.slangp \
   --export out.mp4
 ```
 
@@ -227,7 +227,8 @@ slangfx/
 │   ├── slang_pipeline.{c,h}   Vulkan multi-pass dispatch
 │   └── spv_reflect.{c,h}      SPIR-V reflection for layout discovery
 ├── shaders/                   bundled original effects (see docs/effects.md)
-│   └── <effect>/<effect>.slangp + .slang passes
+│   └── <category>/<effect>/<effect>.slangp + .slang passes
+│       (adjust, color, edges, blur-bloom, motion, beat, glitch)
 ├── wrappers/
 │   ├── slangfx.py             ffmpeg | slangfx | ffmpeg orchestration
 │   ├── slangfx_live.py        live preview + param sliders + export (Dear PyGui)
