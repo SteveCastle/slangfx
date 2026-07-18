@@ -63,7 +63,7 @@ keep `amount = 0` as an exact passthrough.
 |---|---|---|---|
 | `chroma-shift` | 1 | Radial chromatic aberration: R/G/B fringe apart toward the edges, with a soft vignette and saturation lift — a cheap-lens-wide-open look. | `aberration`, `falloff`, `vignette`, `sat` |
 | `thermal` | 1 | False-colour "thermal camera": luminance mapped through a black→magenta→red→orange→yellow→white heat ramp, with a Sobel rim outline. | `contrast`, `bias`, `outline` |
-| `duotone` | 1 | Two-tone print: maps luma onto a gradient between a shadow hue and a highlight hue, plus crawling film grain. | `shadow_hue`, `light_hue`, `contrast`, `grain` |
+| `duotone` | 1 | Two-tone print: maps luma onto a gradient between a shadow hue and a highlight hue, plus animated film grain. | `shadow_hue`, `light_hue`, `contrast`, `grain` |
 | `posterize-pop` | 1 | Comic / cel look: quantises colour into a few flat bands, boosts saturation, and inks a black Sobel outline around shapes. | `levels`, `sat`, `outline`, `thickness` |
 | `kaleidoscope` | 1 | Folds the frame into N mirrored wedges around the centre, slowly rotating the mirror and cycling the hue. | `segments`, `zoom`, `spin`, `hue_speed` |
 | `halftone` | 1 | Print-style halftone: luma-sized dots on a rotated screen grid. | `dot_size`, `angle`, `sharp` |

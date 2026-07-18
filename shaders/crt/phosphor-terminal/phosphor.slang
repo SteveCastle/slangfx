@@ -67,6 +67,16 @@ float hash(vec2 p)
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
 
+// 3D hash: the frame index is a separate dimension, NOT added to the pixel
+// coords — hash(px + frame) translates the whole field diagonally each
+// frame and the noise reads as directional drift instead of static.
+float hash3(vec3 p)
+{
+    p = fract(p * vec3(123.34, 345.45, 678.56));
+    p += dot(p, p.yzx + 34.345);
+    return fract((p.x + p.y) * p.z);
+}
+
 float luma_at(vec2 uv)
 {
     vec3 c = texture(Source, uv).rgb;
@@ -97,7 +107,8 @@ void main()
     // Mains flicker + tube noise.
     float t = params.Time;
     l *= 1.0 - params.flicker * (0.5 + 0.5 * sin(t * 100.0)) * (0.6 + 0.4 * hash(vec2(floor(t * 60.0))));
-    l += (hash(vTexCoord * params.OutputSize.xy + vec2(float(params.FrameCount))) - 0.5) * params.noise_t * (0.25 + l);
+    l += (hash3(vec3(floor(vTexCoord * params.OutputSize.xy),
+                     float(params.FrameCount % 1024u))) - 0.5) * params.noise_t * (0.25 + l);
 
     // Phosphor emission + vignette.
     vec3 tint = vec3(params.tint_r, params.tint_g, params.tint_b);

@@ -52,9 +52,14 @@ layout(location = 0) in vec2 vTexCoord;
 layout(location = 0) out vec4 FragColor;
 layout(set = 0, binding = 2) uniform sampler2D Source;
 
-float hash(vec2 p)
+// 3D hash: the frame index is a separate dimension, NOT added to the pixel
+// coords — hash(px + frame) translates the whole field diagonally each
+// frame and the static reads as directional drift instead of true snow.
+float hash3(vec3 p)
 {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    p = fract(p * vec3(123.34, 345.45, 678.56));
+    p += dot(p, p.yzx + 34.345);
+    return fract((p.x + p.y) * p.z);
 }
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -96,7 +101,8 @@ void main()
     // Drifting hum bar + antenna static.
     float bar = fract(uv.y - params.Time * 0.11);
     col *= 1.0 - params.hum * smoothstep(0.0, 0.18, bar) * smoothstep(0.35, 0.18, bar);
-    float n = hash(vTexCoord * params.OutputSize.xy + vec2(float(params.FrameCount)));
+    float n = hash3(vec3(floor(vTexCoord * params.OutputSize.xy),
+                         float(params.FrameCount % 1024u)));
     col += (n - 0.5) * params.static_tv;
 
     // Corner shading, tube cutoff.
