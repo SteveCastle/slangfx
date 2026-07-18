@@ -511,8 +511,9 @@ async function restoreSession() {
  * stamped into both in parallel and streamed to the GPU. */
 
 const maskOverlay = $('mask-overlay');
-const brush = { size: 60, soft: 0.5, mode: 'hide' }; // media-space px
+const brush = { size: 60, soft: 0.5, mode: 'hide', tool: 'brush' }; // media-space px
 let maskEdit = null;   // { layerIdx } | null
+let gradState = null;  // { from: [x, y] } while dragging a gradient
 
 function makeMaskCanvas() {
   const c = document.createElement('canvas');
@@ -576,6 +577,49 @@ function maskStroke(x, y) {
   fx.updateLayerMask(maskEdit.layerIdx);
 }
 
+/* Photoshop-style gradient fill: replaces the whole mask with a ramp from
+ * the drag start to the drag end (linear) or outward from the start
+ * (radial). Hide mode ramps hidden → visible; Show mode the reverse. */
+function applyGradient(from, to) {
+  const layer = fx.layers[maskEdit.layerIdx];
+  if (!layer?.maskState) return;
+  if (Math.hypot(to[0] - from[0], to[1] - from[1]) < 2) return;
+  const src = layer.maskState.source;
+  const hide = brush.mode === 'hide';
+
+  const ramp = (ctx, c0, c1) => {
+    let g;
+    if (brush.tool === 'radial') {
+      const r = Math.max(Math.hypot(to[0] - from[0], to[1] - from[1]), 2);
+      g = ctx.createRadialGradient(from[0], from[1], 0, from[0], from[1], r);
+    } else {
+      g = ctx.createLinearGradient(from[0], from[1], to[0], to[1]);
+    }
+    g.addColorStop(0, c0);
+    g.addColorStop(1, c1);
+    return g;
+  };
+
+  const mctx = src.getContext('2d');
+  mctx.save();
+  mctx.globalCompositeOperation = 'source-over';
+  mctx.fillStyle = ramp(mctx, hide ? '#000' : '#fff', hide ? '#fff' : '#000');
+  mctx.fillRect(0, 0, src.width, src.height);
+  mctx.restore();
+
+  const rctx = maskOverlay.getContext('2d');
+  rctx.save();
+  rctx.globalCompositeOperation = 'source-over';
+  rctx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+  rctx.fillStyle = ramp(rctx,
+    hide ? 'rgba(255,0,0,1)' : 'rgba(255,0,0,0)',
+    hide ? 'rgba(255,0,0,0)' : 'rgba(255,0,0,1)');
+  rctx.fillRect(0, 0, maskOverlay.width, maskOverlay.height);
+  rctx.restore();
+
+  fx.updateLayerMask(maskEdit.layerIdx);
+}
+
 function overlayToMedia(e) {
   const rect = maskOverlay.getBoundingClientRect();
   return [
@@ -589,13 +633,22 @@ let lastPt = null;
 
 maskOverlay.addEventListener('pointerdown', (e) => {
   if (!maskEdit) return;
-  painting = true;
   try { maskOverlay.setPointerCapture(e.pointerId); } catch {}
-  lastPt = overlayToMedia(e);
-  maskStroke(...lastPt);
+  if (brush.tool === 'brush') {
+    painting = true;
+    lastPt = overlayToMedia(e);
+    maskStroke(...lastPt);
+  } else {
+    gradState = { from: overlayToMedia(e) };
+  }
 });
 maskOverlay.addEventListener('pointermove', (e) => {
-  if (!painting || !maskEdit) return;
+  if (!maskEdit) return;
+  if (gradState) {
+    applyGradient(gradState.from, overlayToMedia(e));   // live preview
+    return;
+  }
+  if (!painting) return;
   const pt = overlayToMedia(e);
   // Stamp along the segment so fast strokes stay solid.
   const step = Math.max(brush.size / 4, 2);
@@ -605,7 +658,13 @@ maskOverlay.addEventListener('pointermove', (e) => {
     maskStroke(lastPt[0] + (pt[0] - lastPt[0]) * i / n, lastPt[1] + (pt[1] - lastPt[1]) * i / n);
   lastPt = pt;
 });
-maskOverlay.addEventListener('pointerup', () => { painting = false; lastPt = null; scheduleSave(); });
+maskOverlay.addEventListener('pointerup', (e) => {
+  if (gradState && maskEdit) applyGradient(gradState.from, overlayToMedia(e));
+  painting = false;
+  lastPt = null;
+  gradState = null;
+  scheduleSave();
+});
 
 async function startMaskEdit(layerIdx) {
   const layer = fx.layers[layerIdx];
@@ -862,6 +921,20 @@ function renderLayerPanel() {
       const mc = document.createElement('div');
       mc.className = 'mask-controls';
 
+      const toolBtn = (tool, icon, title) => {
+        const b = document.createElement('button');
+        b.className = 'btn' + (brush.tool === tool ? ' active' : '');
+        b.textContent = icon;
+        b.title = title;
+        b.onclick = () => { brush.tool = tool; renderLayerPanel(); };
+        return b;
+      };
+      const tools = [
+        toolBtn('brush', '🖌', 'brush'),
+        toolBtn('linear', '▤', 'linear gradient — drag across the preview'),
+        toolBtn('radial', '◎', 'radial gradient — drag outward from the center point'),
+      ];
+
       const modeHide = document.createElement('button');
       modeHide.className = 'btn' + (brush.mode === 'hide' ? ' active' : '');
       modeHide.textContent = 'Hide fx';
@@ -871,11 +944,13 @@ function renderLayerPanel() {
       modeShow.textContent = 'Show fx';
       modeShow.onclick = () => { brush.mode = 'show'; renderLayerPanel(); };
 
+      const isBrush = brush.tool === 'brush';
       const sizeLabel = document.createElement('label');
       sizeLabel.textContent = 'size';
       const size = document.createElement('input');
       size.type = 'range';
       size.min = '8'; size.max = '300'; size.value = String(brush.size);
+      size.disabled = !isBrush;
       size.oninput = () => { brush.size = parseFloat(size.value); };
       sizeLabel.appendChild(size);
 
@@ -884,6 +959,7 @@ function renderLayerPanel() {
       const soft = document.createElement('input');
       soft.type = 'range';
       soft.min = '0'; soft.max = '0.9'; soft.step = '0.05'; soft.value = String(brush.soft);
+      soft.disabled = !isBrush;
       soft.oninput = () => { brush.soft = parseFloat(soft.value); };
       softLabel.appendChild(soft);
 
@@ -925,7 +1001,7 @@ function renderLayerPanel() {
       done.textContent = 'Done';
       done.onclick = () => stopMaskEdit();
 
-      mc.append(modeHide, modeShow, sizeLabel, softLabel, invLabel, opLabel, clear, remove, done);
+      mc.append(...tools, modeHide, modeShow, sizeLabel, softLabel, invLabel, opLabel, clear, remove, done);
       div.appendChild(mc);
     }
 
