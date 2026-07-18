@@ -17,8 +17,6 @@ const scrub = $('scrub');
 const timeLabel = $('time-label');
 const playBtn = $('btn-play');
 const layersEl = $('layers');
-const addLayerBtn = $('add-layer-btn');
-const addLayerPanel = $('add-layer-panel');
 const addLayerSearch = $('add-layer-search');
 const addLayerList = $('add-layer-list');
 
@@ -592,28 +590,36 @@ function rescaleMasks() {
 
 const openFolders = new Set();   // category ids expanded this session
 
-function closeAddMenu() { addLayerPanel.hidden = true; }
-
-function openAddMenu() {
-  addLayerPanel.hidden = false;
+function closeAddMenu() {
+  addLayerList.classList.remove('open');
   addLayerSearch.value = '';
-  rebuildAddMenu();
-  addLayerSearch.focus();
 }
 
-addLayerBtn.addEventListener('click', () => {
-  if (addLayerPanel.hidden) openAddMenu();
-  else closeAddMenu();
-});
+function openAddMenu() {
+  addLayerList.classList.add('open');
+  rebuildAddMenu();
+}
+
+addLayerSearch.addEventListener('focus', openAddMenu);
 
 document.addEventListener('pointerdown', (e) => {
-  if (!addLayerPanel.hidden && !$('add-layer').contains(e.target)) closeAddMenu();
+  if (addLayerList.classList.contains('open') && !$('add-section').contains(e.target)) closeAddMenu();
 });
 
-addLayerSearch.addEventListener('input', () => rebuildAddMenu());
+// "/" jumps to the search from anywhere (unless already typing somewhere).
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.target.matches?.('input, textarea')) return;
+  e.preventDefault();
+  addLayerSearch.focus();
+});
+
+addLayerSearch.addEventListener('input', () => {
+  addLayerList.classList.add('open');
+  rebuildAddMenu();
+});
 addLayerSearch.addEventListener('keydown', (e) => {
   e.stopPropagation();
-  if (e.key === 'Escape') closeAddMenu();
+  if (e.key === 'Escape') { closeAddMenu(); addLayerSearch.blur(); }
   else if (e.key === 'Enter') addLayerList.querySelector('.menu-item')?.click();
 });
 
@@ -696,7 +702,7 @@ function rebuildAddMenu() {
 }
 
 function populateSavedOptions() {
-  if (!addLayerPanel.hidden) rebuildAddMenu();
+  if (addLayerList.classList.contains('open')) rebuildAddMenu();
 }
 
 async function addChoice(choice) {

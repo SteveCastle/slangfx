@@ -15,13 +15,6 @@
         Open media…
         <input type="file" id="file-input" accept="video/*,image/*" hidden>
       </label>
-      <div id="add-layer">
-        <button id="add-layer-btn" class="btn">Add layer… <span class="caret">▾</span></button>
-        <div id="add-layer-panel" hidden>
-          <input type="text" id="add-layer-search" placeholder="Search effects…" spellcheck="false" autocomplete="off">
-          <div id="add-layer-list"></div>
-        </div>
-      </div>
       <button id="btn-export-png" class="btn" title="Export current frame as PNG">Export PNG</button>
       <button id="btn-export-webm" class="btn" title="Record processed output to WebM">Record WebM</button>
     </div>
@@ -52,6 +45,14 @@
     </section>
 
     <aside id="panel">
+      <div id="add-section">
+        <div class="search-wrap">
+          <span class="search-icon">＋</span>
+          <input type="text" id="add-layer-search" placeholder="Add a layer — search or browse" spellcheck="false" autocomplete="off">
+          <kbd>/</kbd>
+        </div>
+        <div id="add-layer-list"></div>
+      </div>
       <h2>Layers</h2>
       <div id="layers"></div>
       <div class="panel-actions">
