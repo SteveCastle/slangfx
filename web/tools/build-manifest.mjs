@@ -12,6 +12,7 @@ const outPath = path.resolve(here, '..', 'demo', 'effects.json');
 const CATEGORY_LABELS = {
   adjust: 'Adjust',
   color: 'Colour & tone',
+  crt: 'CRT & retro displays',
   edges: 'Edge detection',
   'blur-bloom': 'Blur & bloom',
   motion: 'Motion-reactive',

@@ -9,6 +9,10 @@
       "label": "Colour & tone"
     },
     {
+      "id": "crt",
+      "label": "CRT & retro displays"
+    },
+    {
       "id": "edges",
       "label": "Edge detection"
     },
@@ -154,6 +158,61 @@
       "name": "thermal",
       "path": "shaders/color/thermal/thermal.slangp",
       "category": "color"
+    },
+    {
+      "name": "crt-tv",
+      "path": "shaders/crt/crt-tv/crt-tv.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "dot-matrix",
+      "path": "shaders/crt/dot-matrix/dot-matrix.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "eink",
+      "path": "shaders/crt/eink/eink.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "gameboy",
+      "path": "shaders/crt/gameboy/gameboy.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "led-wall",
+      "path": "shaders/crt/led-wall/led-wall.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "amber-terminal",
+      "path": "shaders/crt/phosphor-terminal/amber-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "green-terminal",
+      "path": "shaders/crt/phosphor-terminal/green-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "paper-terminal",
+      "path": "shaders/crt/phosphor-terminal/paper-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "plasma-display",
+      "path": "shaders/crt/plasma-display/plasma-display.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "pvm-grille",
+      "path": "shaders/crt/pvm-grille/pvm-grille.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "vector-display",
+      "path": "shaders/crt/vector-display/vector-display.slangp",
+      "category": "crt"
     },
     {
       "name": "sobel-neon",
