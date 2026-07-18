@@ -46,11 +46,14 @@ vec3 hsv2rgb(vec3 c)
     return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
-float hash(vec2 p)
+// 3D hash: the frame index is a separate dimension, NOT added to the pixel
+// coords — hash(px + frame) translates the whole field diagonally each
+// frame and the grain reads as directional drift instead of static.
+float hash3(vec3 p)
 {
-    p = fract(p * vec2(123.34, 345.45));
-    p += dot(p, p + 34.345);
-    return fract(p.x * p.y);
+    p = fract(p * vec3(123.34, 345.45, 678.56));
+    p += dot(p, p.yzx + 34.345);
+    return fract((p.x + p.y) * p.z);
 }
 
 void main()
@@ -64,8 +67,9 @@ void main()
     float t = smoothstep(0.0, 1.0, l);
     vec3 col = mix(shadow, light, t);
 
-    // Per-pixel grain that crawls each frame.
-    float g = (hash(uv * params.SourceSize.xy + float(params.FrameCount)) - 0.5);
+    // Per-pixel animated grain, re-rolled (not shifted) each frame.
+    float g = hash3(vec3(floor(uv * params.SourceSize.xy),
+                         float(params.FrameCount % 1024u))) - 0.5;
     col += g * params.grain;
 
     vec3 src = texture(Source, uv).rgb;

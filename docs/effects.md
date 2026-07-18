@@ -21,18 +21,41 @@ folder.
 ```bash
 # Batch-render a clip to a file (native res/fps, audio copied):
 python wrappers/slangfx.py -i my_clip.mp4 \
-  --preset shaders/bloom/bloom.slangp -o out.mp4
+  --preset shaders/blur-bloom/bloom/bloom.slangp -o out.mp4
 
 # Tune it live with sliders (and switch effects / export from the menus):
-python wrappers/slangfx_live.py -i my_clip.mp4 --preset shaders/bloom/bloom.slangp
+python wrappers/slangfx_live.py -i my_clip.mp4 --preset shaders/blur-bloom/bloom/bloom.slangp
 
 # Override any parameter (comma-separated name=value):
-python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/thermal/thermal.slangp \
+python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/color/thermal/thermal.slangp \
   --params "contrast=1.8,outline=1.2" -o out.mp4
 ```
 
 In the live tuner, the **Shader** menu auto-lists everything in `shaders/`, so
 you can audition the whole library without relaunching.
+
+## Adjustment primitives (for layering)
+
+Building blocks meant to be **stacked as layers** (Shader → Add layer in the
+live tuner, or repeated `--preset` flags): tone, colour, detail, texture, and
+geometry, each doing one thing with clean sliders. The adjustment ones default
+to **neutral** — adding the layer changes nothing until you dial it — and all
+keep `amount = 0` as an exact passthrough.
+
+| Effect | Passes | What it does | Key params |
+|---|---|---|---|
+| `exposure` | 1 | Exposure (photographic stops), brightness offset, contrast, gamma. | `exposure`, `brightness`, `contrast`, `gamma_adj` |
+| `levels` | 1 | Input/output black & white points with midtone gamma — the Levels dialog as a layer. | `in_black`, `in_white`, `mid_gamma`, `out_black`, `out_white` |
+| `saturation` | 1 | Saturation, vibrance (boosts muted colours more), hue rotation. | `saturation`, `vibrance`, `hue_deg` |
+| `temperature` | 1 | White balance: warm/cool + green/magenta tint, brightness-preserving. | `temperature`, `tint`, `luma_lock` |
+| `split-tone` | 1 | Tint shadows one hue, highlights another (chroma-only, luma untouched). | `shadow_hue`, `shadow_amt`, `high_hue`, `high_amt`, `balance` |
+| `mono` | 1 | B&W via channel mixer (ratios matter, not sums) + optional tint (sepia). | `red_w`, `green_w`, `blue_w`, `tint_hue`, `tint_amt` |
+| `gaussian-blur` | 2 | Separable Gaussian blur, mixed against the clean input by `amount`. | `radius`, `amount` |
+| `sharpen` | 1 | Unsharp mask: strength + radius. | `strength`, `s_radius` |
+| `vignette` | 1 | Radial corner darkening: strength, size, softness, roundness. | `strength`, `v_size`, `softness`, `roundness` |
+| `grain` | 1 | Animated film grain (true static, never drifts), optional colour grain, shadow-weighted. | `strength`, `g_size`, `shadow_bias`, `colored` |
+| `pixelate` | 1 | Mosaic resample to N-px blocks. | `px` |
+| `transform` | 1 | Zoom / pan / rotate / flip, aspect-corrected, black outside the frame. | `zoom`, `pan_x`, `pan_y`, `rot_deg`, `flip_h`, `flip_v` |
 
 ## Colour & tone
 
@@ -40,9 +63,31 @@ you can audition the whole library without relaunching.
 |---|---|---|---|
 | `chroma-shift` | 1 | Radial chromatic aberration: R/G/B fringe apart toward the edges, with a soft vignette and saturation lift — a cheap-lens-wide-open look. | `aberration`, `falloff`, `vignette`, `sat` |
 | `thermal` | 1 | False-colour "thermal camera": luminance mapped through a black→magenta→red→orange→yellow→white heat ramp, with a Sobel rim outline. | `contrast`, `bias`, `outline` |
-| `duotone` | 1 | Two-tone print: maps luma onto a gradient between a shadow hue and a highlight hue, plus crawling film grain. | `shadow_hue`, `light_hue`, `contrast`, `grain` |
+| `duotone` | 1 | Two-tone print: maps luma onto a gradient between a shadow hue and a highlight hue, plus animated film grain. | `shadow_hue`, `light_hue`, `contrast`, `grain` |
 | `posterize-pop` | 1 | Comic / cel look: quantises colour into a few flat bands, boosts saturation, and inks a black Sobel outline around shapes. | `levels`, `sat`, `outline`, `thickness` |
 | `kaleidoscope` | 1 | Folds the frame into N mirrored wedges around the centre, slowly rotating the mirror and cycling the hue. | `segments`, `zoom`, `spin`, `hue_speed` |
+| `halftone` | 1 | Print-style halftone: luma-sized dots on a rotated screen grid. | `dot_size`, `angle`, `sharp` |
+
+## CRT & retro displays
+
+Full display emulations — point them at anything and it plays back on
+period glass. Three of them are monochrome phosphor terminals sharing one
+engine (`phosphor.slang`) with per-preset tints; several use `PassFeedback`
+for phosphor persistence / LCD lag.
+
+| Effect | Passes | What it does | Key params |
+|---|---|---|---|
+| `green-terminal` | 1 | P1 green phosphor terminal (VT100 / IBM 5151): scanlines, curvature, glow, long-persistence trails, mains flicker, tube noise. | `scan_strength`, `curvature`, `glow`, `persistence`, `flicker`, `tint_*` |
+| `amber-terminal` | 1 | P3 amber phosphor (Wyse / Hercules) — same engine, warm tint. | same as `green-terminal` |
+| `paper-terminal` | 1 | Paper-white mono (VT320 / NeXT): crisper, faster phosphor — less glow and persistence. | same as `green-terminal` |
+| `crt-tv` | 1 | Living-room television: curvature, slot-mask triads, composite chroma bleed, beam scanlines, drifting hum bar, antenna static. | `curvature`, `mask_strength`, `bleed`, `hum`, `static_tv` |
+| `pvm-grille` | 1 | Sony PVM/BVM broadcast monitor: razor aperture grille, tight bloom, faint scanlines, saturation lift, no curvature. | `grille_strength`, `bloom_p`, `sharp_p`, `sat_p` |
+| `gameboy` | 1 | DMG-01 LCD: four pea-soup green shades, Bayer dither, dot grid, slow-LCD motion ghosting. | `res_px`, `ghost`, `grid_gb`, `dither_gb` |
+| `plasma-display` | 1 | Orange gas-plasma panel (GRiD Compass): coarse cells, few brightness levels, gas glow, 60 Hz shimmer. | `cell_px`, `levels_p`, `gap_p`, `glow_p` |
+| `vector-display` | 1 | XY vector monitor (Asteroids / radar): Sobel strokes as glowing beam traces with halo, phosphor trails, jitter, graticule. | `beam`, `threshold_v`, `trail_v`, `jitter_v`, `tint_*` |
+| `dot-matrix` | 1 | Amber LED marquee: round dots lit by luma, quantized levels, unlit husks; recolor via `led_*`. | `dot_px`, `dot_size_dm`, `unlit_dm`, `led_*` |
+| `led-wall` | 1 | Stadium RGB LED billboard: rounded modules, dark seams, driver banding, bloom across gaps, refresh shimmer. | `cell_w`, `gap_w`, `banding_w`, `bloom_w` |
+| `eink` | 1 | E-paper: warm paper + ink, ordered dither, static grain, refresh ghosting — the anti-CRT. | `ink_levels`, `dither_e`, `ghost_e`, `paper_e` |
 
 ## Edge detection
 
@@ -100,7 +145,10 @@ with `beat_cut.py` for cut-locked visuals.
 ## Authoring notes
 
 - Each effect is self-contained in its folder (`<name>.slang` + `<name>.slangp`,
-  plus any helper passes). Copy a folder as a starting template.
+  plus any helper passes). Copy a folder as a starting template. Effects are
+  grouped into category folders — `shaders/<category>/<effect>/` — matching
+  the sections on this page (`adjust`, `color`, `crt`, `edges`,
+  `blur-bloom`, `motion`, `beat`, `glitch`).
 - The standard push-constant fields (`SourceSize`, `OriginalSize`, `OutputSize`,
   `FrameCount`) and the realtime `Time` field are available; see
   [slang format]({{ '/slang_format.html' | relative_url }}).

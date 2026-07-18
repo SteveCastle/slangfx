@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>slangfx live — web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>slangfx <span class="accent">live</span> <span class="tag">web / WebGPU</span></h1>
+    <div class="toolbar">
+      <label class="btn">
+        Open media…
+        <input type="file" id="file-input" accept="video/*,image/*" hidden>
+      </label>
+      <div id="add-layer">
+        <button id="add-layer-btn" class="btn">Add layer… <span class="caret">▾</span></button>
+        <div id="add-layer-panel" hidden>
+          <input type="text" id="add-layer-search" placeholder="Search effects…" spellcheck="false" autocomplete="off">
+          <div id="add-layer-list"></div>
+        </div>
+      </div>
+      <button id="btn-export-png" class="btn" title="Export current frame as PNG">Export PNG</button>
+      <button id="btn-export-webm" class="btn" title="Record processed output to WebM">Record WebM</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="preview-wrap">
+      <div id="drop-hint">drop a video / image here<br><small>or use Open media…</small></div>
+      <canvas id="preview"></canvas>
+      <div id="transport">
+        <button id="btn-play" class="btn" disabled>Pause</button>
+        <input type="range" id="scrub" min="0" max="0" step="0.01" value="0" disabled>
+        <span id="time-label">--:-- / --:--</span>
+      </div>
+    </section>
+
+    <aside id="panel">
+      <h2>Layers</h2>
+      <div id="layers"></div>
+      <div class="panel-actions">
+        <button id="btn-copy-params" class="btn">Copy params</button>
+        <button id="btn-reset" class="btn">Reset</button>
+      </div>
+      <div id="status">loading toolchain…</div>
+    </aside>
+  </main>
+
+  <video id="video" hidden muted playsinline loop crossorigin="anonymous"></video>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

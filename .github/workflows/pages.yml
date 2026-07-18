@@ -1,0 +1,70 @@
+# GitHub Pages: docs site + the WebGPU live demo.
+#
+# Replaces the legacy "deploy from main:/docs" Pages build with an
+# actions-based deploy that serves the same Jekyll docs at the site root
+# and additionally ships:
+#   /web/demo/   the slangfx-web live tuner (WebGPU proof of concept)
+#   /web/src/    the slangfx-web ES module it imports
+#   /web/vendor/ the wasm shader toolchain (glslang + twgsl)
+#   /shaders/    the bundled effects, fetched by the demo at runtime
+#
+# configure-pages runs with `enablement: true`, so the first run on main
+# switches the repo's Pages config from the legacy build to this workflow
+# automatically — no manual settings change needed.
+
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Build docs (Jekyll)
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Generate effects manifest
+        run: node web/tools/build-manifest.mjs
+
+      # The Jekyll container leaves _site root-owned; use sudo to extend it.
+      - name: Add web demo + shaders to site
+        run: |
+          sudo mkdir -p _site/web
+          sudo cp -r web/demo web/src web/vendor _site/web/
+          sudo cp -r shaders _site/shaders
+
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

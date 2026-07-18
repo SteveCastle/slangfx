@@ -1,0 +1,278 @@
+{
+  "categories": [
+    {
+      "id": "adjust",
+      "label": "Adjust"
+    },
+    {
+      "id": "color",
+      "label": "Colour & tone"
+    },
+    {
+      "id": "crt",
+      "label": "CRT & retro displays"
+    },
+    {
+      "id": "edges",
+      "label": "Edge detection"
+    },
+    {
+      "id": "blur-bloom",
+      "label": "Blur & bloom"
+    },
+    {
+      "id": "motion",
+      "label": "Motion-reactive"
+    },
+    {
+      "id": "beat",
+      "label": "Tempo-synced"
+    },
+    {
+      "id": "glitch",
+      "label": "Glitch & analog"
+    }
+  ],
+  "effects": [
+    {
+      "name": "exposure",
+      "path": "shaders/adjust/exposure/exposure.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "gaussian-blur",
+      "path": "shaders/adjust/gaussian-blur/gaussian-blur.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "grain",
+      "path": "shaders/adjust/grain/grain.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "levels",
+      "path": "shaders/adjust/levels/levels.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "mono",
+      "path": "shaders/adjust/mono/mono.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "pixelate",
+      "path": "shaders/adjust/pixelate/pixelate.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "saturation",
+      "path": "shaders/adjust/saturation/saturation.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "sharpen",
+      "path": "shaders/adjust/sharpen/sharpen.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "split-tone",
+      "path": "shaders/adjust/split-tone/split-tone.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "temperature",
+      "path": "shaders/adjust/temperature/temperature.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "transform",
+      "path": "shaders/adjust/transform/transform.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "vignette",
+      "path": "shaders/adjust/vignette/vignette.slangp",
+      "category": "adjust"
+    },
+    {
+      "name": "beat-glitch",
+      "path": "shaders/beat/beat-glitch/beat-glitch.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "beat-kaleido",
+      "path": "shaders/beat/beat-kaleido/beat-kaleido.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "beat-strobe",
+      "path": "shaders/beat/beat-strobe/beat-strobe.slangp",
+      "category": "beat"
+    },
+    {
+      "name": "bloom",
+      "path": "shaders/blur-bloom/bloom/bloom.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "motion-bloom",
+      "path": "shaders/blur-bloom/motion-bloom/motion-bloom.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "soft-crt",
+      "path": "shaders/blur-bloom/soft-crt/soft-crt.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "tilt-shift",
+      "path": "shaders/blur-bloom/tilt-shift/tilt-shift.slangp",
+      "category": "blur-bloom"
+    },
+    {
+      "name": "chroma-shift",
+      "path": "shaders/color/chroma-shift/chroma-shift.slangp",
+      "category": "color"
+    },
+    {
+      "name": "duotone",
+      "path": "shaders/color/duotone/duotone.slangp",
+      "category": "color"
+    },
+    {
+      "name": "halftone",
+      "path": "shaders/color/halftone/halftone.slangp",
+      "category": "color"
+    },
+    {
+      "name": "kaleidoscope",
+      "path": "shaders/color/kaleidoscope/kaleidoscope.slangp",
+      "category": "color"
+    },
+    {
+      "name": "posterize-pop",
+      "path": "shaders/color/posterize-pop/posterize-pop.slangp",
+      "category": "color"
+    },
+    {
+      "name": "thermal",
+      "path": "shaders/color/thermal/thermal.slangp",
+      "category": "color"
+    },
+    {
+      "name": "crt-tv",
+      "path": "shaders/crt/crt-tv/crt-tv.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "dot-matrix",
+      "path": "shaders/crt/dot-matrix/dot-matrix.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "eink",
+      "path": "shaders/crt/eink/eink.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "gameboy",
+      "path": "shaders/crt/gameboy/gameboy.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "led-wall",
+      "path": "shaders/crt/led-wall/led-wall.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "amber-terminal",
+      "path": "shaders/crt/phosphor-terminal/amber-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "green-terminal",
+      "path": "shaders/crt/phosphor-terminal/green-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "paper-terminal",
+      "path": "shaders/crt/phosphor-terminal/paper-terminal.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "plasma-display",
+      "path": "shaders/crt/plasma-display/plasma-display.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "pvm-grille",
+      "path": "shaders/crt/pvm-grille/pvm-grille.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "vector-display",
+      "path": "shaders/crt/vector-display/vector-display.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "sobel-neon",
+      "path": "shaders/edges/sobel-neon/sobel-neon.slangp",
+      "category": "edges"
+    },
+    {
+      "name": "datamosh",
+      "path": "shaders/glitch/datamosh/datamosh.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "datamosh_skin",
+      "path": "shaders/glitch/datamosh-skin/datamosh_skin.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "feedback-echo",
+      "path": "shaders/glitch/feedback-echo/feedback-echo.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "pixelsort",
+      "path": "shaders/glitch/pixelsort/pixelsort.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "scrambled-crt",
+      "path": "shaders/glitch/scrambled-crt/scrambled-crt.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "slice-glitch",
+      "path": "shaders/glitch/slice-glitch/slice-glitch.slangp",
+      "category": "glitch"
+    },
+    {
+      "name": "motion-pulse",
+      "path": "shaders/motion/motion-pulse/motion-pulse.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "motion-shatter",
+      "path": "shaders/motion/motion-shatter/motion-shatter.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "motion-trails",
+      "path": "shaders/motion/motion-trails/motion-trails.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "perlin-flow",
+      "path": "shaders/motion/perlin-flow/perlin-flow.slangp",
+      "category": "motion"
+    },
+    {
+      "name": "voronoi-shatter",
+      "path": "shaders/motion/voronoi-shatter/voronoi-shatter.slangp",
+      "category": "motion"
+    }
+  ]
+}
