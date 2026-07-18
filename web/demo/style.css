@@ -376,10 +376,27 @@ body.has-media #transport { display: flex; }
 
 .layer-params { padding: 2px 8px 8px; border-top: 1px solid var(--border); }
 
-.param-row { display: grid; grid-template-columns: 1fr 92px 44px; gap: 8px; align-items: center; margin-top: 4px; }
+.param-row { display: grid; grid-template-columns: 1fr 86px 54px; gap: 8px; align-items: center; margin-top: 4px; }
 .param-row label { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .param-row input[type=range] { width: 100%; accent-color: var(--accent); }
-.param-row .val { text-align: right; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--fg); }
+
+.param-row .val {
+  width: 100%;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 4px;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.param-row .val::-webkit-outer-spin-button,
+.param-row .val::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.param-row .val:hover { border-color: var(--border); background: var(--bg); }
+.param-row .val:focus { outline: none; border-color: var(--accent); background: var(--bg); }
 
 .mask-controls {
   display: flex;

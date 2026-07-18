@@ -974,14 +974,32 @@ function renderLayerPanel() {
         slider.step = String(p.step || 0.001);
         slider.value = String(p.value);
 
-        const val = document.createElement('span');
+        const fmt = (v) => (+v).toFixed(3).replace(/\.?0+$/, '') || '0';
+        const val = document.createElement('input');
+        val.type = 'number';
         val.className = 'val';
-        val.textContent = (+p.value).toFixed(3).replace(/\.?0+$/, '') || '0';
+        val.min = String(p.min);
+        val.max = String(p.max);
+        val.step = String(p.step || 0.001);
+        val.value = fmt(p.value);
+        val.addEventListener('keydown', (e) => e.stopPropagation());
+        val.addEventListener('input', () => {
+          const v = parseFloat(val.value);
+          if (Number.isNaN(v)) return;
+          fx.setParam(info.index, p.name, v);
+          slider.value = String(v);
+          scheduleSave();
+        });
+        val.addEventListener('change', () => {
+          // Normalize display to the engine's clamped value on commit.
+          const cur = fx.getLayerInfo()[info.index]?.params.find((q) => q.name === p.name);
+          if (cur) { val.value = fmt(cur.value); slider.value = String(cur.value); }
+        });
 
         slider.oninput = () => {
           const v = parseFloat(slider.value);
           fx.setParam(info.index, p.name, v);
-          val.textContent = v.toFixed(3).replace(/\.?0+$/, '') || '0';
+          val.value = fmt(v);
           scheduleSave();
         };
 
