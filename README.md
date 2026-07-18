@@ -134,7 +134,10 @@ Some shaders depend on features not yet implemented — see
 
 slangfx also ships its own library of original effects under [`shaders/`](shaders/)
 — colour grading, edge detection, blurs, blooms, motion-reactive feedback,
-tempo-synced beats, and glitch/analog looks (25 presets). They follow the same
+tempo-synced beats, glitch/analog looks, and a set of 12 adjustment
+primitives (exposure, levels, saturation, white balance, split-tone, mono,
+gaussian-blur, sharpen, vignette, grain, pixelate, transform) built for
+stacking as layers (37 presets). They follow the same
 `.slangp` format, so they run anywhere a libretro preset does:
 
 ```bash
@@ -180,6 +183,24 @@ python -m venv .venv
 
 .venv/Scripts/python wrappers/slangfx_live.py   # start empty; load a clip + effect from the menus
 ```
+
+### Run it in the browser (WebGPU + WASM)
+
+[`web/`](web/) contains **slangfx-web**: the same slang shader chains
+running in the browser — the glslang + tint shader toolchain compiled to
+WebAssembly, the multi-pass runtime ported to WebGPU, and a web version of
+the live tuner (layers, sliders, scrub, PNG/WebM export). All 37 bundled
+presets work, feedback and multi-pass included. It's also an embeddable ES
+module for use in other apps (headless rendering supported).
+
+**Try it live: <https://SteveCastle.github.io/slangfx/web/demo/>** — or run
+it locally:
+
+```bash
+cd web && npm install && npm run serve   # → http://localhost:8788/web/demo/
+```
+
+See [`web/README.md`](web/README.md) for the architecture and embedding API.
 
 ### Tuning shader parameters
 

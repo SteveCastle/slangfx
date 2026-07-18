@@ -31,3 +31,5 @@ Thumbs.db
 TODO.local.md
 *.local.*
 scratch/
+.playwright-mcp/
+web/node_modules/

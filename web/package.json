@@ -1,0 +1,21 @@
+{
+  "name": "slangfx-web",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node tools/test-compile.mjs",
+    "serve": "node tools/serve.mjs",
+    "manifest": "node tools/build-manifest.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "libretro slang shader chains on WebGPU (wasm shader toolchain)",
+  "dependencies": {
+    "@webgpu/glslang": "^0.0.15"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  }
+}

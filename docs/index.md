@@ -18,6 +18,7 @@ python wrappers/slangfx.py \
 
 ## Documentation
 
+- **[Live demo]({{ '/web/demo/' | relative_url }})** — try the bundled effects on your own video, right in the browser (WebGPU; Chrome/Edge 113+).
 - **[Install]({{ '/install.html' | relative_url }})** — Vulkan SDK, ffmpeg, build from source on Windows / Linux / macOS.
 - **[Usage]({{ '/usage.html' | relative_url }})** — `slangfx` CLI, the Python wrapper, low-level pipe orchestration.
 - **[Tested shaders]({{ '/shaders.html' | relative_url }})** — what's known to work end-to-end, plus tuning notes.
