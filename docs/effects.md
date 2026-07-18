@@ -34,6 +34,29 @@ python wrappers/slangfx.py -i my_clip.mp4 --preset shaders/thermal/thermal.slang
 In the live tuner, the **Shader** menu auto-lists everything in `shaders/`, so
 you can audition the whole library without relaunching.
 
+## Adjustment primitives (for layering)
+
+Building blocks meant to be **stacked as layers** (Shader → Add layer in the
+live tuner, or repeated `--preset` flags): tone, colour, detail, texture, and
+geometry, each doing one thing with clean sliders. The adjustment ones default
+to **neutral** — adding the layer changes nothing until you dial it — and all
+keep `amount = 0` as an exact passthrough.
+
+| Effect | Passes | What it does | Key params |
+|---|---|---|---|
+| `exposure` | 1 | Exposure (photographic stops), brightness offset, contrast, gamma. | `exposure`, `brightness`, `contrast`, `gamma_adj` |
+| `levels` | 1 | Input/output black & white points with midtone gamma — the Levels dialog as a layer. | `in_black`, `in_white`, `mid_gamma`, `out_black`, `out_white` |
+| `saturation` | 1 | Saturation, vibrance (boosts muted colours more), hue rotation. | `saturation`, `vibrance`, `hue_deg` |
+| `temperature` | 1 | White balance: warm/cool + green/magenta tint, brightness-preserving. | `temperature`, `tint`, `luma_lock` |
+| `split-tone` | 1 | Tint shadows one hue, highlights another (chroma-only, luma untouched). | `shadow_hue`, `shadow_amt`, `high_hue`, `high_amt`, `balance` |
+| `mono` | 1 | B&W via channel mixer (ratios matter, not sums) + optional tint (sepia). | `red_w`, `green_w`, `blue_w`, `tint_hue`, `tint_amt` |
+| `gaussian-blur` | 2 | Separable Gaussian blur, mixed against the clean input by `amount`. | `radius`, `amount` |
+| `sharpen` | 1 | Unsharp mask: strength + radius. | `strength`, `s_radius` |
+| `vignette` | 1 | Radial corner darkening: strength, size, softness, roundness. | `strength`, `v_size`, `softness`, `roundness` |
+| `grain` | 1 | Animated film grain (true static, never drifts), optional colour grain, shadow-weighted. | `strength`, `g_size`, `shadow_bias`, `colored` |
+| `pixelate` | 1 | Mosaic resample to N-px blocks. | `px` |
+| `transform` | 1 | Zoom / pan / rotate / flip, aspect-corrected, black outside the frame. | `zoom`, `pan_x`, `pan_y`, `rot_deg`, `flip_h`, `flip_v` |
+
 ## Colour & tone
 
 | Effect | Passes | What it does | Key params |
