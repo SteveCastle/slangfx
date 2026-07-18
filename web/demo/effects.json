@@ -5,20 +5,20 @@
       "label": "Adjust"
     },
     {
-      "id": "color",
-      "label": "Colour & tone"
+      "id": "blur-bloom",
+      "label": "Blur & bloom"
+    },
+    {
+      "id": "stylize",
+      "label": "Stylize"
+    },
+    {
+      "id": "dither",
+      "label": "Dithering"
     },
     {
       "id": "crt",
       "label": "CRT & retro displays"
-    },
-    {
-      "id": "edges",
-      "label": "Edge detection"
-    },
-    {
-      "id": "blur-bloom",
-      "label": "Blur & bloom"
     },
     {
       "id": "motion",
@@ -40,11 +40,6 @@
       "category": "adjust"
     },
     {
-      "name": "gaussian-blur",
-      "path": "shaders/adjust/gaussian-blur/gaussian-blur.slangp",
-      "category": "adjust"
-    },
-    {
       "name": "grain",
       "path": "shaders/adjust/grain/grain.slangp",
       "category": "adjust"
@@ -57,11 +52,6 @@
     {
       "name": "mono",
       "path": "shaders/adjust/mono/mono.slangp",
-      "category": "adjust"
-    },
-    {
-      "name": "pixelate",
-      "path": "shaders/adjust/pixelate/pixelate.slangp",
       "category": "adjust"
     },
     {
@@ -115,49 +105,14 @@
       "category": "blur-bloom"
     },
     {
-      "name": "motion-bloom",
-      "path": "shaders/blur-bloom/motion-bloom/motion-bloom.slangp",
-      "category": "blur-bloom"
-    },
-    {
-      "name": "soft-crt",
-      "path": "shaders/blur-bloom/soft-crt/soft-crt.slangp",
+      "name": "gaussian-blur",
+      "path": "shaders/blur-bloom/gaussian-blur/gaussian-blur.slangp",
       "category": "blur-bloom"
     },
     {
       "name": "tilt-shift",
       "path": "shaders/blur-bloom/tilt-shift/tilt-shift.slangp",
       "category": "blur-bloom"
-    },
-    {
-      "name": "chroma-shift",
-      "path": "shaders/color/chroma-shift/chroma-shift.slangp",
-      "category": "color"
-    },
-    {
-      "name": "duotone",
-      "path": "shaders/color/duotone/duotone.slangp",
-      "category": "color"
-    },
-    {
-      "name": "halftone",
-      "path": "shaders/color/halftone/halftone.slangp",
-      "category": "color"
-    },
-    {
-      "name": "kaleidoscope",
-      "path": "shaders/color/kaleidoscope/kaleidoscope.slangp",
-      "category": "color"
-    },
-    {
-      "name": "posterize-pop",
-      "path": "shaders/color/posterize-pop/posterize-pop.slangp",
-      "category": "color"
-    },
-    {
-      "name": "thermal",
-      "path": "shaders/color/thermal/thermal.slangp",
-      "category": "color"
     },
     {
       "name": "crt-tv",
@@ -210,14 +165,74 @@
       "category": "crt"
     },
     {
+      "name": "scrambled-crt",
+      "path": "shaders/crt/scrambled-crt/scrambled-crt.slangp",
+      "category": "crt"
+    },
+    {
+      "name": "soft-crt",
+      "path": "shaders/crt/soft-crt/soft-crt.slangp",
+      "category": "crt"
+    },
+    {
       "name": "vector-display",
       "path": "shaders/crt/vector-display/vector-display.slangp",
       "category": "crt"
     },
     {
-      "name": "sobel-neon",
-      "path": "shaders/edges/sobel-neon/sobel-neon.slangp",
-      "category": "edges"
+      "name": "ascii-dither",
+      "path": "shaders/dither/ascii-dither/ascii-dither.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "bayer-dither",
+      "path": "shaders/dither/bayer-dither/bayer-dither.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "blue-noise-dither",
+      "path": "shaders/dither/blue-noise-dither/blue-noise-dither.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "cga-dither",
+      "path": "shaders/dither/cga-dither/cga-dither.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "cluster-dot",
+      "path": "shaders/dither/cluster-dot/cluster-dot.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "crosshatch",
+      "path": "shaders/dither/crosshatch/crosshatch.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "flow-dither",
+      "path": "shaders/dither/flow-dither/flow-dither.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "line-screen",
+      "path": "shaders/dither/line-screen/line-screen.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "mac-1bit",
+      "path": "shaders/dither/mac-1bit/mac-1bit.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "stipple",
+      "path": "shaders/dither/stipple/stipple.slangp",
+      "category": "dither"
+    },
+    {
+      "name": "chroma-shift",
+      "path": "shaders/glitch/chroma-shift/chroma-shift.slangp",
+      "category": "glitch"
     },
     {
       "name": "datamosh",
@@ -240,14 +255,14 @@
       "category": "glitch"
     },
     {
-      "name": "scrambled-crt",
-      "path": "shaders/glitch/scrambled-crt/scrambled-crt.slangp",
-      "category": "glitch"
-    },
-    {
       "name": "slice-glitch",
       "path": "shaders/glitch/slice-glitch/slice-glitch.slangp",
       "category": "glitch"
+    },
+    {
+      "name": "motion-bloom",
+      "path": "shaders/motion/motion-bloom/motion-bloom.slangp",
+      "category": "motion"
     },
     {
       "name": "motion-pulse",
@@ -273,6 +288,41 @@
       "name": "voronoi-shatter",
       "path": "shaders/motion/voronoi-shatter/voronoi-shatter.slangp",
       "category": "motion"
+    },
+    {
+      "name": "duotone",
+      "path": "shaders/stylize/duotone/duotone.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "halftone",
+      "path": "shaders/stylize/halftone/halftone.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "kaleidoscope",
+      "path": "shaders/stylize/kaleidoscope/kaleidoscope.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "pixelate",
+      "path": "shaders/stylize/pixelate/pixelate.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "posterize-pop",
+      "path": "shaders/stylize/posterize-pop/posterize-pop.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "sobel-neon",
+      "path": "shaders/stylize/sobel-neon/sobel-neon.slangp",
+      "category": "stylize"
+    },
+    {
+      "name": "thermal",
+      "path": "shaders/stylize/thermal/thermal.slangp",
+      "category": "stylize"
     }
   ]
 }

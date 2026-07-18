@@ -133,11 +133,14 @@ Some shaders depend on features not yet implemented — see
 ### Bundled effects
 
 slangfx also ships its own library of original effects under [`shaders/`](shaders/)
-— colour grading, edge detection, blurs, blooms, motion-reactive feedback,
-tempo-synced beats, glitch/analog looks, and a set of 12 adjustment
-primitives (exposure, levels, saturation, white balance, split-tone, mono,
-gaussian-blur, sharpen, vignette, grain, pixelate, transform) built for
-stacking as layers, and a CRT & retro-display wing — phosphor terminals (green/amber/paper), consumer TV, PVM, Game Boy LCD, gas plasma, vector monitor, LED marquee/wall, e-ink (48 presets). They follow the same
+— adjustment primitives built for stacking as layers (exposure, levels,
+saturation, white balance, split-tone, mono, sharpen, vignette, grain,
+transform), blurs and blooms, stylized looks (halftone, duotone, thermal,
+posterize, kaleidoscope, pixelate, neon edges), motion-reactive feedback,
+tempo-synced beats, glitch/analog looks, and a CRT & retro-display wing —
+phosphor terminals (green/amber/paper), consumer TV, PVM, Game Boy LCD,
+gas plasma, vector monitor, LED marquee/wall, e-ink — plus ten dithering strategies from Bayer and blue-noise to ASCII glyphs, CGA palettes, crosshatch and stipple (58 presets). They
+follow the same
 `.slangp` format, so they run anywhere a libretro preset does:
 
 ```bash
@@ -165,8 +168,8 @@ H.264 or a single frame to PNG/JPEG (stills render as a clip of
 
 ```bash
 python wrappers/slangfx_live.py -i in.mp4 \
-  --preset shaders/blur-bloom/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
-  --preset shaders/color/chroma-shift/chroma-shift.slangp \
+  --preset shaders/crt/soft-crt/soft-crt.slangp --params "scan_strength=0.2" \
+  --preset shaders/glitch/chroma-shift/chroma-shift.slangp \
   --export out.mp4
 ```
 
@@ -189,7 +192,7 @@ python -m venv .venv
 [`web/`](web/) contains **slangfx-web**: the same slang shader chains
 running in the browser — the glslang + tint shader toolchain compiled to
 WebAssembly, the multi-pass runtime ported to WebGPU, and a web version of
-the live tuner (layers, sliders, scrub, PNG/WebM export). All 48 bundled
+the live tuner (layers, sliders, scrub, PNG/WebM export). All 58 bundled
 presets work, feedback and multi-pass included. It's also an embeddable ES
 module for use in other apps (headless rendering supported).
 
@@ -228,7 +231,7 @@ slangfx/
 │   └── spv_reflect.{c,h}      SPIR-V reflection for layout discovery
 ├── shaders/                   bundled original effects (see docs/effects.md)
 │   └── <category>/<effect>/<effect>.slangp + .slang passes
-│       (adjust, color, edges, blur-bloom, motion, beat, glitch)
+│       (adjust, blur-bloom, stylize, dither, crt, motion, beat, glitch)
 ├── wrappers/
 │   ├── slangfx.py             ffmpeg | slangfx | ffmpeg orchestration
 │   ├── slangfx_live.py        live preview + param sliders + export (Dear PyGui)
