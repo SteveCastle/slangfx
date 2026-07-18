@@ -251,10 +251,11 @@ class PresetRuntime {
     const nPasses = this.passes.length;
     this.collectParams();
 
-    // External textures (Phase 8 equivalent).
+    // External textures (Phase 8 equivalent). A host-supplied override
+    // (image / canvas / bitmap) replaces the preset's file per layer.
     for (const tex of this.preset.textures) {
       try {
-        const bitmap = await this.fx.readImage(tex.path);
+        const bitmap = this.textureOverrides?.[tex.name] ?? await this.fx.readImage(tex.path);
         const gpuTex = device.createTexture({
           label: `slangfx ext ${tex.name}`,
           size: [bitmap.width, bitmap.height],
@@ -739,6 +740,7 @@ export class SlangFx {
         for (const pass of preset.passes) modules.push(await this.compileModule(pass.path, compileOpts));
         const rt = new PresetRuntime(this, preset, modules, layerInput, this.inputW, this.inputH);
         rt.maskView = layer.maskView ?? null;   // `Mask` sampler for custom shaders
+        rt.textureOverrides = layer.textureOverrides ?? null;
         if (layer.savedParams)
           for (const [k, v] of layer.savedParams) rt.paramValues.set(k, v);
         await rt.build();
@@ -813,6 +815,16 @@ export class SlangFx {
     this.device.queue.copyExternalImageToTexture({ source: src }, { texture: layer.maskTex }, [this.inputW, this.inputH]);
   }
 
+  /** Replace one of a layer's external textures (preset `textures = ...`)
+   * with any copyExternalImageToTexture source — image, canvas, bitmap.
+   * Used for user-supplied stamps / rendered titles. */
+  async setLayerTexture(i, name, source) {
+    const layer = this.layers[i];
+    if (!layer) return;
+    (layer.textureOverrides ??= {})[name] = source;
+    await this.rebuild();
+  }
+
   /** Update mask opacity / inversion without a rebuild. */
   setLayerMaskOptions(i, { opacity, invert } = {}) {
     const layer = this.layers[i];
@@ -833,6 +845,7 @@ export class SlangFx {
       mask: layer.maskState
         ? { opacity: layer.maskState.opacity ?? 1, invert: !!layer.maskState.invert }
         : null,
+      textures: layer.runtime ? layer.runtime.preset.textures.map((t) => t.name) : [],
       params: layer.runtime
         ? layer.runtime.paramMeta.map((m) => ({ ...m, value: layer.runtime.paramValues.get(m.name) }))
         : [],

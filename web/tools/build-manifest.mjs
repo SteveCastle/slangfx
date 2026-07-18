@@ -19,6 +19,7 @@ const CATEGORY_LABELS = {
   motion: 'Motion-reactive',
   beat: 'Tempo-synced',
   glitch: 'Glitch & analog',
+  overlay: 'Overlay',
 };
 
 function* findPresets(dir) {

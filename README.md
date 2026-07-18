@@ -139,7 +139,7 @@ transform), blurs and blooms, stylized looks (halftone, duotone, thermal,
 posterize, kaleidoscope, pixelate, neon edges), motion-reactive feedback,
 tempo-synced beats, glitch/analog looks, and a CRT & retro-display wing —
 phosphor terminals (green/amber/paper), consumer TV, PVM, Game Boy LCD,
-gas plasma, vector monitor, LED marquee/wall, e-ink — plus ten dithering strategies from Bayer and blue-noise to ASCII glyphs, CGA palettes, crosshatch and stipple, and a colour-split family (RGB split, lens chromatic aberration, anaglyph 3D-glasses, prism smear, temporal split) (65 presets). They
+gas plasma, vector monitor, LED marquee/wall, e-ink — plus ten dithering strategies from Bayer and blue-noise to ASCII glyphs, CGA palettes, crosshatch and stipple, and a colour-split family (RGB split, lens chromatic aberration, anaglyph 3D-glasses, prism smear, temporal split), and a stamp/title overlay (66 presets). They
 follow the same
 `.slangp` format, so they run anywhere a libretro preset does:
 
@@ -192,7 +192,7 @@ python -m venv .venv
 [`web/`](web/) contains **slangfx-web**: the same slang shader chains
 running in the browser — the glslang + tint shader toolchain compiled to
 WebAssembly, the multi-pass runtime ported to WebGPU, and a web version of
-the live tuner (layers, sliders, scrub, PNG/WebM export). All 65 bundled
+the live tuner (layers, sliders, scrub, PNG/WebM export). All 66 bundled
 presets work, feedback and multi-pass included. It's also an embeddable ES
 module for use in other apps (headless rendering supported).
 
@@ -231,7 +231,7 @@ slangfx/
 │   └── spv_reflect.{c,h}      SPIR-V reflection for layout discovery
 ├── shaders/                   bundled original effects (see docs/effects.md)
 │   └── <category>/<effect>/<effect>.slangp + .slang passes
-│       (adjust, blur-bloom, stylize, split, dither, crt, motion, beat, glitch)
+│       (adjust, blur-bloom, stylize, split, dither, crt, motion, beat, glitch, overlay)
 ├── wrappers/
 │   ├── slangfx.py             ffmpeg | slangfx | ffmpeg orchestration
 │   ├── slangfx_live.py        live preview + param sliders + export (Dear PyGui)

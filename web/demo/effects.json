@@ -35,6 +35,10 @@
     {
       "id": "glitch",
       "label": "Glitch & analog"
+    },
+    {
+      "id": "overlay",
+      "label": "Overlay"
     }
   ],
   "effects": [
@@ -292,6 +296,11 @@
       "name": "voronoi-shatter",
       "path": "shaders/motion/voronoi-shatter/voronoi-shatter.slangp",
       "category": "motion"
+    },
+    {
+      "name": "stamp",
+      "path": "shaders/overlay/stamp/stamp.slangp",
+      "category": "overlay"
     },
     {
       "name": "anaglyph-3d",

@@ -414,6 +414,32 @@ body.has-media #transport { display: flex; }
 .mask-controls input[type=range] { width: 64px; accent-color: var(--accent); }
 .mask-controls .btn.active { border-color: var(--accent); color: var(--accent); }
 
+.overlay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--dim);
+}
+.overlay-controls .overlay-text {
+  flex: 1;
+  min-width: 90px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.overlay-controls .overlay-text:focus { outline: none; border-color: var(--accent); }
+.overlay-controls .overlay-size { width: 52px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 4px; font-size: 11px; }
+.overlay-controls input[type=color] { width: 26px; height: 24px; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg3); }
+.overlay-controls select { max-width: 110px; background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 4px; font-size: 11px; }
+.overlay-controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+
 .layer-editor { padding: 6px 8px 8px; border-top: 1px solid var(--border); }
 .layer-editor textarea {
   width: 100%;

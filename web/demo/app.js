@@ -455,6 +455,13 @@ function saveSession() {
       savedName: isCustom ? savedNames.get(dir) ?? null : null,
       enabled: layer.enabled,
       params,
+      overlay: layer.overlaySources && Object.keys(layer.overlaySources).length
+        ? Object.fromEntries(Object.entries(layer.overlaySources).map(([k, o]) =>
+            // Very large images would blow the localStorage quota and lose
+            // the whole session — persist them as "not restorable" instead.
+            [k, o.kind === 'image' && (o.dataURL?.length ?? 0) > 2_000_000
+              ? { kind: 'image', dataURL: null } : o]))
+        : null,
       mask: layer.maskState ? {
         dataURL: layer.maskState.source.toDataURL('image/png'),
         opacity: layer.maskState.opacity ?? 1,
@@ -488,6 +495,19 @@ async function restoreSession() {
       idx = await fx.addLayer(l.path, l.label ? { label: l.label } : {});
     }
     for (const [k, v] of Object.entries(l.params ?? {})) fx.setParam(idx, k, v);
+    if (l.overlay) {
+      fx.layers[idx].overlaySources = l.overlay;
+      for (const [name, o] of Object.entries(l.overlay)) {
+        if (o.kind === 'text' && o.state?.text) {
+          await fx.setLayerTexture(idx, name, renderTitleCanvas(o.state));
+        } else if (o.kind === 'image' && o.dataURL) {
+          const img = new Image();
+          await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; img.src = o.dataURL; });
+          // copyExternalImageToTexture rejects HTMLImageElement — use a bitmap.
+          if (img.width) await fx.setLayerTexture(idx, name, await createImageBitmap(img));
+        }
+      }
+    }
     if (l.mask?.dataURL) {
       const img = new Image();
       await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; img.src = l.mask.dataURL; });
@@ -703,6 +723,66 @@ function rescaleMasks() {
   });
 }
 
+/* ---- overlay textures (stamp images + rendered titles) -------------- */
+
+const STAMP_PRESET_PATH = 'shaders/overlay/stamp/stamp.slangp';
+const DEFAULT_TITLE = { text: 'TITLE', font: 'Arial', sizePx: 96, color: '#ffffff', outline: true };
+
+/** Render a title into a tightly-sized transparent canvas. */
+function renderTitleCanvas({ text, font, sizePx, color, outline }) {
+  const pad = Math.ceil(sizePx * 0.4);
+  const c = document.createElement('canvas');
+  let ctx = c.getContext('2d');
+  ctx.font = `bold ${sizePx}px ${font}`;
+  const w = Math.ceil(ctx.measureText(text || ' ').width);
+  c.width = Math.max(2, w + pad * 2);
+  c.height = Math.ceil(sizePx * 1.35) + pad;
+  ctx = c.getContext('2d');
+  ctx.font = `bold ${sizePx}px ${font}`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  if (outline) {
+    ctx.lineWidth = Math.max(2, sizePx * 0.09);
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(0,0,0,0.9)';
+    ctx.strokeText(text, c.width / 2, c.height / 2);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(text, c.width / 2, c.height / 2);
+  return c;
+}
+
+async function applyOverlaySource(layerIdx, name, source) {
+  await fx.setLayerTexture(layerIdx, name, source);
+  scheduleSave();
+}
+
+/* Persistent picker for stamp images: a detached input's change event can
+ * be lost to GC in Chrome, so one hidden input in the DOM is reused, with
+ * the target layer/texture stashed before each open. */
+const stampFileInput = $('stamp-file-input');
+let stampPickTarget = null;   // { layerIdx, texName }
+
+stampFileInput.addEventListener('change', async () => {
+  const f = stampFileInput.files[0];
+  const target = stampPickTarget;
+  stampFileInput.value = '';
+  stampPickTarget = null;
+  if (!f || !target) return;
+  const layer = fx.layers[target.layerIdx];
+  if (!layer) return;
+  const bmp = await createImageBitmap(f);
+  // Keep a data URL copy so the session can restore it.
+  const c = document.createElement('canvas');
+  c.width = bmp.width;
+  c.height = bmp.height;
+  c.getContext('2d').drawImage(bmp, 0, 0);
+  (layer.overlaySources ??= {})[target.texName] = { kind: 'image', dataURL: c.toDataURL('image/png') };
+  await applyOverlaySource(target.layerIdx, target.texName, bmp);
+  renderLayerPanel();
+  setStatus(`${target.texName} texture replaced with ${f.name}`);
+});
+
 /* ---- layer stack --------------------------------------------------- */
 
 /* ---- add-layer dropdown: folders + type-ahead search ---------------- */
@@ -771,6 +851,8 @@ function rebuildAddMenu() {
     // Searching: collapse everything to one flat, filtered list.
     if ('custom shader write your own'.includes(q))
       addItem('✎ custom shader', () => addChoice('__custom__'));
+    if ('text title caption overlay'.includes(q))
+      addItem('T text / title', () => addChoice('__title__'));
     for (const name of savedList)
       if (name.toLowerCase().includes(q))
         addItem(`🗎 ${name}`, () => addChoice(`__saved__:${name}`), 'saved');
@@ -788,8 +870,9 @@ function rebuildAddMenu() {
     return;
   }
 
-  // Browsing: pinned custom entry, then collapsible folders.
+  // Browsing: pinned entries, then collapsible folders.
   addItem('✎ custom shader (write your own)', () => addChoice('__custom__'));
+  addItem('T text / title', () => addChoice('__title__'));
 
   const folder = (id, label, children) => {
     if (!children.length) return;
@@ -829,10 +912,15 @@ async function addChoice(choice) {
   if (!fx.inputTexture) { setStatus('load a video or image first'); return; }
   let path = choice;
   let opts = {};
+  let pendingTitle = false;
   if (choice === '__custom__') {
     const dir = newCustomLayerFiles();
     path = dir + 'custom.slangp';
     opts = { label: `custom shader ${dir.split('/')[1]}` };
+  } else if (choice === '__title__') {
+    path = STAMP_PRESET_PATH;
+    opts = { label: 'title' };
+    pendingTitle = true;
   } else if (choice.startsWith('__saved__:')) {
     const name = choice.slice('__saved__:'.length);
     const saves = loadSaved();
@@ -845,6 +933,11 @@ async function addChoice(choice) {
   setStatus(`compiling ${opts.label ?? path}…`);
   const t0 = performance.now();
   await fx.addLayer(path, opts);
+  if (pendingTitle) {
+    const idx = fx.layers.length - 1;
+    fx.layers[idx].overlaySources = { Stamp: { kind: 'text', state: { ...DEFAULT_TITLE } } };
+    await applyOverlaySource(idx, 'Stamp', renderTitleCanvas(DEFAULT_TITLE));
+  }
   const info = fx.getLayerInfo();
   const last = info[info.length - 1];
   setStatus(last.error ? `layer failed: ${last.error}` : `added ${last.name} in ${Math.round(performance.now() - t0)} ms`);
@@ -1090,6 +1183,82 @@ function renderLayerPanel() {
       row.append(compile, revert, nameInput, save, forget);
       editor.append(ta, row);
       div.appendChild(editor);
+    }
+
+    if (info.enabled && info.textures?.length) {
+      const layer = fx.layers[info.index];
+      layer.overlaySources ??= {};
+      for (const texName of info.textures) {
+        const oc = document.createElement('div');
+        oc.className = 'overlay-controls';
+        const state = layer.overlaySources[texName]?.kind === 'text'
+          ? layer.overlaySources[texName].state
+          : { ...DEFAULT_TITLE, text: '' };
+
+        const imgBtn = document.createElement('button');
+        imgBtn.className = 'btn';
+        imgBtn.textContent = 'Image…';
+        imgBtn.title = `use an image as the ${texName} texture`;
+        imgBtn.onclick = () => {
+          stampPickTarget = { layerIdx: info.index, texName };
+          stampFileInput.click();
+        };
+
+        const textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.className = 'overlay-text';
+        textInput.placeholder = 'type a title…';
+        textInput.value = state.text ?? '';
+        textInput.addEventListener('keydown', (e) => e.stopPropagation());
+
+        const sizeInput = document.createElement('input');
+        sizeInput.type = 'number';
+        sizeInput.className = 'overlay-size';
+        sizeInput.min = '12'; sizeInput.max = '400'; sizeInput.step = '4';
+        sizeInput.value = String(state.sizePx);
+        sizeInput.title = 'font size (px)';
+        sizeInput.addEventListener('keydown', (e) => e.stopPropagation());
+
+        const colorInput = document.createElement('input');
+        colorInput.type = 'color';
+        colorInput.value = state.color;
+        colorInput.title = 'text color';
+
+        const fontSel = document.createElement('select');
+        for (const f of ['Arial', 'Georgia', 'Impact', 'Courier New', 'Trebuchet MS']) {
+          const o = document.createElement('option');
+          o.value = f; o.textContent = f;
+          if (f === state.font) o.selected = true;
+          fontSel.appendChild(o);
+        }
+
+        const outlineLabel = document.createElement('label');
+        const outline = document.createElement('input');
+        outline.type = 'checkbox';
+        outline.checked = state.outline;
+        outlineLabel.append(outline, 'outline');
+
+        const applyText = async () => {
+          const s = {
+            text: textInput.value,
+            font: fontSel.value,
+            sizePx: Math.max(12, parseFloat(sizeInput.value) || 96),
+            color: colorInput.value,
+            outline: outline.checked,
+          };
+          if (!s.text.trim()) return;
+          layer.overlaySources[texName] = { kind: 'text', state: s };
+          await applyOverlaySource(info.index, texName, renderTitleCanvas(s));
+        };
+        textInput.addEventListener('change', applyText);
+        sizeInput.addEventListener('change', applyText);
+        colorInput.addEventListener('change', applyText);
+        fontSel.addEventListener('change', applyText);
+        outline.addEventListener('change', applyText);
+
+        oc.append(imgBtn, textInput, sizeInput, colorInput, fontSel, outlineLabel);
+        div.appendChild(oc);
+      }
     }
 
     if (info.enabled && info.params.length) {

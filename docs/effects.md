@@ -69,6 +69,12 @@ Graphic looks — print, cel, false-colour, geometric.
 | `pixelate` | 1 | Mosaic resample to N-px blocks. | `px` |
 | `sobel-neon` | 1 | Sobel edge detection drawn as glowing neon lines whose hue follows the gradient direction; the flat interior is darkened so edges pop. | `scale` (edge gain), `threshold`, `glow`, `bg` |
 
+## Overlay
+
+| Effect | Passes | What it does | Key params |
+|---|---|---|---|
+| `stamp` | 1 | Composites the external `Stamp` texture over the frame at a position, with size (aspect-preserving), rotation, opacity and normal/screen/multiply blending. In the web tuner the texture can be swapped for any image — or for text rendered by the built-in title tool (font, size, color, outline). | `pos_x`, `pos_y`, `size_st`, `rot_st`, `opacity_st`, `blend_st` |
+
 ## Colour split
 
 Channel-separation looks — every way to pull R, G and B apart. (See also

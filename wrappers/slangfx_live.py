@@ -355,13 +355,17 @@ class Pipeline:
     def set_param(self, layer, name, value):
         """Send a live k=v update routed to `layer` ('i:name=value' protocol,
         where i is the layer's position among the ENABLED layers in the
-        chain). No-op for layers not in the chain (disabled)."""
+        chain). With a single layer, send the un-prefixed form instead — it
+        means the same thing and also works with pre-layer slangfx binaries
+        (which silently drop prefixed names). No-op for layers not in the
+        chain (disabled)."""
         idx = next((i for i, l in enumerate(self.layers) if l is layer), None)
         if idx is None:
             return
+        msg = (f"{name}={value}" if len(self.layers) == 1
+               else f"{idx}:{name}={value}")
         try:
-            self.sock.sendto(f"{idx}:{name}={value}".encode(),
-                             ("127.0.0.1", self.port))
+            self.sock.sendto(msg.encode(), ("127.0.0.1", self.port))
         except OSError:
             pass
 
@@ -889,11 +893,19 @@ def run_gui(args, w, h, layers):
         return [{"preset": l["preset"], "params_str": layer_params_string(i, l)}
                 for i, l in enumerate(state["layers"]) if l["enabled"]]
 
-    def start_export(out_path):
+    def start_export(out_path, duration_ok=False):
         if not state["video"]:
             dpg.set_value("status", "load a video or image before exporting")
             return
         if state.get("export_view") or not out_path:
+            return
+        # Still image -> video clip: ask how long the clip should run (the
+        # shader animates over the whole length). Frame exports skip this.
+        if (is_image(state["video"]) and not duration_ok
+                and not out_path.lower().endswith(IMAGE_EXTS)):
+            state["pending_export"] = out_path
+            dpg.set_value("img_dur", float(args.image_duration))
+            dpg.show_item("dlg_duration")
             return
         exp_layers = export_layers()
         # Frame exports render the frame under the playhead.
@@ -943,6 +955,21 @@ def run_gui(args, w, h, layers):
         f = app_data.get("file_path_name")
         if f:
             start_export(f)
+
+    def on_duration_ok():
+        try:
+            args.image_duration = max(0.5, float(dpg.get_value("img_dur")))
+        except (TypeError, ValueError):
+            pass
+        dpg.hide_item("dlg_duration")
+        out = state.pop("pending_export", None)
+        if out:
+            start_export(out, duration_ok=True)
+
+    def on_duration_cancel():
+        state.pop("pending_export", None)
+        dpg.hide_item("dlg_duration")
+        dpg.set_value("status", "export cancelled")
 
     # --- switching --------------------------------------------------------
     def start(video=_UNSET, preset=_UNSET, at=None):
@@ -1000,6 +1027,7 @@ def run_gui(args, w, h, layers):
         # A fresh port every rebuild avoids any bind race with the old proc.
         port = state["port_next"]
         state["port_next"] += 1
+        state["pipe_built_at"] = time.time()
         try:
             state["pipe"] = make_pipeline(args, state["video"], state["layers"],
                                           w, h, port, start_at=resume)
@@ -1056,6 +1084,21 @@ def run_gui(args, w, h, layers):
                                ".png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff}",
                                color=(255, 220, 120))
         dpg.add_file_extension(".*")
+    with dpg.window(label="Still image -> video clip", tag="dlg_duration",
+                    modal=True, show=False, no_resize=True, no_collapse=True,
+                    width=360, pos=(160, 140)):
+        dpg.add_text("The source is a single image. Choose the clip length —\n"
+                     "animated shader effects run across the whole clip.",
+                     color=(200, 200, 200))
+        dpg.add_input_float(tag="img_dur", label="clip length (s)",
+                            default_value=10.0, min_value=0.5,
+                            max_value=3600.0, min_clamped=True,
+                            max_clamped=True, step=1.0, width=140)
+        dpg.add_spacer(height=4)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Export", width=100, callback=on_duration_ok)
+            dpg.add_button(label="Cancel", width=100, callback=on_duration_cancel)
+
     with dpg.file_dialog(directory_selector=False, show=False, modal=True,
                          callback=on_export_pick, tag="dlg_export",
                          width=720, height=440):
@@ -1194,8 +1237,37 @@ def run_gui(args, w, h, layers):
 
     start()   # build initial state (plays if a video was given, else empty)
 
+    # A stale engine silently drops routed slider updates and runs only one
+    # layer of a stack — the failure looks like "sliders stopped working",
+    # so call it out loudly up front.
+    if not engine_supports_layers(args.slangfx):
+        msg = (f"WARNING: outdated slangfx binary ({args.slangfx}) — "
+               "update it; layer stacks and live sliders need a current build")
+        print(msg, flush=True)
+        dpg.set_value("status", msg)
+
+    def fit_preview(vw, vh):
+        """Scale the preview widget (and the widgets sized off it) to fit the
+        window, preserving aspect. The texture itself stays w x h — only the
+        displayed size changes."""
+        avail_w = max(vw - 375, 160)          # right panel + paddings
+        avail_h = max(vh - 95, 120)           # menu bar + transport + paddings
+        s = min(avail_w / w, avail_h / h)
+        dw, dh = max(int(w * s), 32), max(int(h * s), 32)
+        dpg.configure_item("preview_img", width=dw, height=dh)
+        dpg.configure_item("scrub", width=max(dw - 180, 60))
+        dpg.configure_item("export_panel", width=dw, height=dh)
+        dpg.configure_item("export_bar", width=dw - 30)
+        dpg.configure_item("export_log", width=dw - 30, height=max(dh - 200, 60))
+
     scale = np.float32(1.0 / 255.0)
+    last_client = (0, 0)
     while dpg.is_dearpygui_running():
+        client = (dpg.get_viewport_client_width(),
+                  dpg.get_viewport_client_height())
+        if client != last_client:
+            last_client = client
+            fit_preview(*client)
         if dropped:
             handle_drops()
         ex = state.get("exporter")
@@ -1230,6 +1302,15 @@ def run_gui(args, w, h, layers):
                     dpg.set_value("preview_tex", arr)
                 if not p.running and p.frames == 0:
                     dpg.set_value("status", "could not open source (check the file)")
+                elif not p.running:
+                    # The decoder stopped mid-stream — a container whose
+                    # demuxer can't rewind for -stream_loop, or a decode
+                    # error. Playback must always loop, so restart from the
+                    # top (keeping slider values); the 1s guard prevents a
+                    # rebuild storm if the file dies instantly every time.
+                    if time.time() - state.get("pipe_built_at", 0) > 1.0:
+                        snapshot_params()
+                        start(at=0.0)
                 if state["duration"] > 0:
                     if dpg.is_item_active("scrub"):
                         # Mid-drag: preview the target time, don't fight the drag.
@@ -1342,6 +1423,19 @@ def run_selftest(args, w, h, layers):
     ok = ctrl_ok and switch_ok and chain_ok
     print("SELFTEST PASS" if ok else "SELFTEST FAIL")
     return 0 if ok else 1
+
+
+def engine_supports_layers(slangfx):
+    """True when the slangfx binary understands multi-preset stacks and
+    'i:name=value' routed live control (both shipped together — probed via
+    the --help text). Assume modern when the probe itself fails; the goal is
+    a loud warning for stale binaries, not a hard gate."""
+    try:
+        r = subprocess.run([slangfx, "--help"], capture_output=True,
+                           text=True, timeout=5, **_NOWIN)
+        return "Repeatable" in (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        return True
 
 
 def default_slangfx(here):
