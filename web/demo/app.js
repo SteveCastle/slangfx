@@ -317,7 +317,7 @@ viewer.addEventListener('pointerdown', (e) => {
   if (e.target.closest('.btn')) return;
   panState = { x: e.clientX, y: e.clientY, sl: viewer.scrollLeft, st: viewer.scrollTop };
   viewer.classList.add('panning');
-  viewer.setPointerCapture(e.pointerId);
+  try { viewer.setPointerCapture(e.pointerId); } catch {}
 });
 viewer.addEventListener('pointermove', (e) => {
   if (!panState) return;
@@ -532,7 +532,7 @@ let lastPt = null;
 maskOverlay.addEventListener('pointerdown', (e) => {
   if (!maskEdit) return;
   painting = true;
-  maskOverlay.setPointerCapture(e.pointerId);
+  try { maskOverlay.setPointerCapture(e.pointerId); } catch {}
   lastPt = overlayToMedia(e);
   maskStroke(...lastPt);
 });

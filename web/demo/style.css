@@ -133,7 +133,8 @@ main { flex: 1; display: flex; min-height: 0; }
   position: relative;
 }
 
-#viewer.size-actual { overflow: auto; cursor: grab; }
+#viewer.size-actual { overflow: auto; cursor: grab; scrollbar-width: none; }
+#viewer.size-actual::-webkit-scrollbar { display: none; }
 #viewer.size-actual.panning { cursor: grabbing; user-select: none; }
 
 #view-controls {
