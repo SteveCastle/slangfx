@@ -33,6 +33,12 @@ Enter adds the first hit). Sliders update live with no rebuild; PNG frame
 export and WebM recording are built in. The **⛶** button (or double-click)
 takes the preview fullscreen — works for video and still images alike.
 
+The preview is a proper viewer pane with three sizing modes (top-right of
+the pane, remembered across reloads): **Fit** letterboxes into the pane,
+**Cover** fills it (cropping), and **1:1** shows native pixels with the
+pane scrolling independently of the sidebar — drag anywhere to pan in
+both axes.
+
 Sessions persist across reloads: the loaded media file is kept in
 IndexedDB and the layer stack — order, enabled state, slider values,
 custom-shader sources, and painted masks — in localStorage, restored

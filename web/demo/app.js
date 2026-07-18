@@ -277,6 +277,56 @@ scrub.addEventListener('change', () => {
   scrubbing = false;
 });
 
+/* ---- viewer sizing modes (fit / cover / 1:1) ------------------------ */
+
+const viewer = $('viewer');
+const VIEWMODE_KEY = 'slangfx-web.viewmode';
+
+/* Fit-mode sizing: cap the canvas to the pane in device pixels. Inline
+ * styles (not CSS %) because percentage max-heights can't resolve through
+ * the fit-content wrappers that keep the mask overlay glued to the canvas. */
+function applyViewSizing() {
+  if (viewer.classList.contains('size-fit') && !document.fullscreenElement) {
+    canvas.style.maxWidth = `${viewer.clientWidth}px`;
+    canvas.style.maxHeight = `${viewer.clientHeight}px`;
+  } else {
+    canvas.style.maxWidth = '';
+    canvas.style.maxHeight = '';
+  }
+}
+
+new ResizeObserver(applyViewSizing).observe(viewer);
+document.addEventListener('fullscreenchange', applyViewSizing);
+
+function setViewMode(mode) {
+  viewer.className = `size-${mode}`;
+  for (const b of document.querySelectorAll('#view-controls .btn'))
+    b.classList.toggle('active', b.dataset.mode === mode);
+  applyViewSizing();
+  try { localStorage.setItem(VIEWMODE_KEY, mode); } catch {}
+}
+
+for (const b of document.querySelectorAll('#view-controls .btn'))
+  b.addEventListener('click', () => setViewMode(b.dataset.mode));
+setViewMode(localStorage.getItem(VIEWMODE_KEY) ?? 'fit');
+
+/* Drag-to-pan in 1:1 mode — the pane is a scroll container in both axes. */
+let panState = null;
+viewer.addEventListener('pointerdown', (e) => {
+  if (!viewer.classList.contains('size-actual') || maskEdit) return;
+  if (e.target.closest('.btn')) return;
+  panState = { x: e.clientX, y: e.clientY, sl: viewer.scrollLeft, st: viewer.scrollTop };
+  viewer.classList.add('panning');
+  viewer.setPointerCapture(e.pointerId);
+});
+viewer.addEventListener('pointermove', (e) => {
+  if (!panState) return;
+  viewer.scrollLeft = panState.sl - (e.clientX - panState.x);
+  viewer.scrollTop = panState.st - (e.clientY - panState.y);
+});
+viewer.addEventListener('pointerup', () => { panState = null; viewer.classList.remove('panning'); });
+viewer.addEventListener('pointercancel', () => { panState = null; viewer.classList.remove('panning'); });
+
 /* ---- fullscreen ----------------------------------------------------- */
 
 const canvasStack = $('canvas-stack');
@@ -502,6 +552,8 @@ maskOverlay.addEventListener('pointerup', () => { painting = false; lastPt = nul
 async function startMaskEdit(layerIdx) {
   const layer = fx.layers[layerIdx];
   if (!layer) return;
+  // Cover crops the canvas box, which would skew brush coordinates.
+  if (viewer.classList.contains('size-cover')) setViewMode('fit');
   if (!layer.maskState) {
     await fx.setLayerMask(layerIdx, makeMaskCanvas());
     renderLayerPanel();

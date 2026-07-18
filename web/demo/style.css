@@ -115,12 +115,40 @@ main { flex: 1; display: flex; min-height: 0; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 12px;
   gap: 8px;
   position: relative;
 }
+
+/* The viewer pane: clips/scrolls the media independently of the sidebar. */
+#viewer {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+#viewer.size-actual { overflow: auto; cursor: grab; }
+#viewer.size-actual.panning { cursor: grabbing; user-select: none; }
+
+#view-controls {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 6;
+  display: none;
+  gap: 4px;
+  opacity: 0.4;
+  transition: opacity 0.15s;
+}
+body.has-media #view-controls { display: flex; }
+#preview-wrap:hover #view-controls { opacity: 1; }
+#view-controls .btn.active { border-color: var(--accent); color: var(--accent); }
 
 #drop-hint {
   position: absolute;
@@ -141,11 +169,43 @@ body.has-media #drop-hint { display: none; }
   position: relative;
   display: none;
   width: fit-content;
-  max-width: 100%;
-  max-height: calc(100% - 40px);
+  margin: auto;      /* safe centering inside a scrollable viewer */
   min-height: 0;
 }
 body.has-media #canvas-stack { display: block; }
+
+/* Fit: scale down to the pane, keep aspect (default). The actual pixel
+ * caps are set inline by applyViewSizing() — CSS percentage max-heights
+ * cannot resolve through the fit-content wrappers. */
+
+/* Cover: fill the pane, crop the overflow. */
+#viewer.size-cover #canvas-stack,
+#viewer.size-cover #canvas-inner {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+}
+#viewer.size-cover #preview {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: cover;
+}
+
+/* Actual: native pixels; the pane scrolls / pans instead of scaling. */
+#viewer.size-actual #canvas-stack,
+#viewer.size-actual #canvas-inner {
+  max-width: none;
+  max-height: none;
+}
+#viewer.size-actual #preview {
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+}
 
 #canvas-stack:fullscreen {
   display: flex;
