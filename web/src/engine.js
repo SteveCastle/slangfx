@@ -28,7 +28,7 @@
 import { parsePreset, dirnameOf } from './slangp.js';
 import { compileSlang } from './compiler.js';
 import { renameReserved } from './preprocess.js';
-import { Blitter } from './blit.js';
+import { Blitter, MaskBlender } from './blit.js';
 
 /* Quad matching the native vertex contract (location 0 = vec4 Position,
  * location 1 = vec2 TexCoord), with v oriented so that every pass keeps
@@ -173,10 +173,13 @@ class PresetRuntime {
     return 1;
   }
 
-  /* Map a sampler name to {view, sampler}. Port of resolve_sampler_name. */
+  /* Map a sampler name to {view, sampler}. Port of resolve_sampler_name,
+   * plus `Mask`: the layer's painted mask (white when none is set), so
+   * custom shaders can read the mask directly. */
   resolveSampler(name, passIdx, prevView, prevSampler) {
     const { fx } = this;
     if (name === 'Source') return { view: prevView, sampler: prevSampler };
+    if (name === 'Mask') return { view: this.maskView ?? fx.whiteView, sampler: fx.inputSampler };
     if (name === 'Original' || name.startsWith('OriginalHistory'))
       return { view: this.inputView, sampler: fx.inputSampler };
     if (name.startsWith('PassFeedback')) {
@@ -597,6 +600,13 @@ export class SlangFx {
     });
     fx.device.queue.writeTexture({ texture: dummy }, new Uint8Array([0, 0, 0, 255]), {}, [1, 1]);
     fx.dummyView = dummy.createView();
+    const white = fx.device.createTexture({
+      size: [1, 1], format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    fx.device.queue.writeTexture({ texture: white }, new Uint8Array([255, 255, 255, 255]), {}, [1, 1]);
+    fx.whiteView = white.createView();
+    fx.maskBlender = new MaskBlender(fx.device);
 
     if (opts.canvas) {
       fx.canvas = opts.canvas;
@@ -677,6 +687,35 @@ export class SlangFx {
 
   async clearLayers() { this.layers = []; await this.rebuild(); }
 
+  /* Create (or recreate) a layer's mask texture at input dims, cleared to
+   * white (= effect fully visible), then upload the painted source if its
+   * dimensions match. */
+  _buildLayerMask(layer) {
+    layer.maskTex?.destroy();
+    layer.maskTex = this.device.createTexture({
+      label: 'slangfx layer mask',
+      size: [this.inputW, this.inputH],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    layer.maskView = layer.maskTex.createView();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: layer.maskView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 1, g: 1, b: 1, a: 1 } }],
+    });
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    this.updateLayerMask(this.layers.indexOf(layer));
+  }
+
+  _destroyLayerMaskGpu(layer) {
+    layer.maskTex?.destroy();
+    layer.blendTex?.destroy();
+    layer.maskOptsBuf?.destroy();
+    layer.maskTex = layer.maskView = layer.blendTex = layer.blendView = null;
+    layer.blendBindGroup = layer.maskOptsBuf = null;
+  }
+
   /** Rebuild every layer's GPU state (structural changes + source resize). */
   async rebuild() {
     if (!this.inputTexture) return;
@@ -685,16 +724,21 @@ export class SlangFx {
       layer.runtime?.destroy();
       layer.runtime = null;
       layer.error = null;
+      layer.effectiveView = null;
+      this._destroyLayerMaskGpu(layer);
     }
     let inputView = this.inputView;
     for (const layer of this.layers) {
       if (!layer.enabled) continue;
+      if (layer.maskState) this._buildLayerMask(layer);
+      const layerInput = inputView;
       const buildOnce = async (compileOpts) => {
         const presetText = await this.readFile(layer.path);
         const preset = parsePreset(presetText, dirnameOf(layer.path));
         const modules = [];
         for (const pass of preset.passes) modules.push(await this.compileModule(pass.path, compileOpts));
-        const rt = new PresetRuntime(this, preset, modules, inputView, this.inputW, this.inputH);
+        const rt = new PresetRuntime(this, preset, modules, layerInput, this.inputW, this.inputH);
+        rt.maskView = layer.maskView ?? null;   // `Mask` sampler for custom shaders
         if (layer.savedParams)
           for (const [k, v] of layer.savedParams) rt.paramValues.set(k, v);
         await rt.build();
@@ -710,12 +754,72 @@ export class SlangFx {
           rt = await buildOnce({ textureLodWorkaround: true });
         }
         layer.runtime = rt;
-        inputView = rt.finalPass.outView;
+        if (layer.maskState) {
+          layer.blendTex = this.device.createTexture({
+            label: 'slangfx masked out',
+            size: [this.inputW, this.inputH],
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+          });
+          layer.blendView = layer.blendTex.createView();
+          layer.maskOptsBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this._writeMaskOpts(layer);
+          layer.blendBindGroup = this.maskBlender.bindGroup(
+            layerInput, rt.finalPass.outView, layer.maskView, this.inputSampler, layer.maskOptsBuf);
+          layer.effectiveView = layer.blendView;
+        } else {
+          layer.effectiveView = rt.finalPass.outView;
+        }
+        inputView = layer.effectiveView;
       } catch (e) {
         layer.error = String(e.message ?? e);
         console.error(`slangfx: layer '${layer.path}' failed:`, e);
       }
     }
+  }
+
+  _writeMaskOpts(layer) {
+    if (!layer.maskOptsBuf || !layer.maskState) return;
+    this.device.queue.writeBuffer(layer.maskOptsBuf, 0,
+      new Float32Array([layer.maskState.opacity ?? 1, layer.maskState.invert ? 1 : 0, 0, 0]));
+  }
+
+  /** Attach (or replace) a painted mask on a layer. `source` is any
+   * canvas/image whose pixels' red channel is the mask (white = effect
+   * fully visible). Keep the source around and call updateLayerMask()
+   * after painting into it. */
+  async setLayerMask(i, source, { opacity = 1, invert = false } = {}) {
+    const layer = this.layers[i];
+    if (!layer) return;
+    layer.maskState = { source, opacity, invert };
+    await this.rebuild();
+  }
+
+  /** Remove a layer's mask entirely. */
+  async clearLayerMask(i) {
+    const layer = this.layers[i];
+    if (!layer?.maskState) return;
+    layer.maskState = null;
+    await this.rebuild();
+  }
+
+  /** Re-upload a layer's mask pixels from its source (cheap — call during
+   * brush strokes; no rebuild). */
+  updateLayerMask(i) {
+    const layer = this.layers[i];
+    const src = layer?.maskState?.source;
+    if (!layer?.maskTex || !src) return;
+    if ((src.width ?? 0) !== this.inputW || (src.height ?? 0) !== this.inputH) return;
+    this.device.queue.copyExternalImageToTexture({ source: src }, { texture: layer.maskTex }, [this.inputW, this.inputH]);
+  }
+
+  /** Update mask opacity / inversion without a rebuild. */
+  setLayerMaskOptions(i, { opacity, invert } = {}) {
+    const layer = this.layers[i];
+    if (!layer?.maskState) return;
+    if (opacity != null) layer.maskState.opacity = opacity;
+    if (invert != null) layer.maskState.invert = invert;
+    this._writeMaskOpts(layer);
   }
 
   /** Per-layer info for UIs: params with metadata + current values. */
@@ -726,6 +830,9 @@ export class SlangFx {
       name: layer.label ?? layer.path.split('/').pop(),
       enabled: layer.enabled,
       error: layer.error,
+      mask: layer.maskState
+        ? { opacity: layer.maskState.opacity ?? 1, invert: !!layer.maskState.invert }
+        : null,
       params: layer.runtime
         ? layer.runtime.paramMeta.map((m) => ({ ...m, value: layer.runtime.paramValues.get(m.name) }))
         : [],
@@ -742,18 +849,20 @@ export class SlangFx {
     for (const m of rt.paramMeta) rt.paramValues.set(m.name, m.default);
   }
 
-  get activeRuntimes() {
-    return this.layers.filter((l) => l.enabled && l.runtime).map((l) => l.runtime);
+  get activeLayers() {
+    return this.layers.filter((l) => l.enabled && l.runtime);
   }
 
   get finalView() {
-    const rts = this.activeRuntimes;
-    return rts.length ? rts[rts.length - 1].finalPass.outView : this.inputView;
+    const ls = this.activeLayers;
+    return ls.length ? ls[ls.length - 1].effectiveView : this.inputView;
   }
 
   get finalTexture() {
-    const rts = this.activeRuntimes;
-    return rts.length ? rts[rts.length - 1].finalPass.outTex : this.inputTexture;
+    const ls = this.activeLayers;
+    if (!ls.length) return this.inputTexture;
+    const last = ls[ls.length - 1];
+    return last.blendTex ?? last.runtime.finalPass.outTex;
   }
 
   /**
@@ -781,9 +890,11 @@ export class SlangFx {
     }
 
     const encoder = this.device.createCommandEncoder();
-    for (const rt of this.activeRuntimes) {
-      rt.writeUniforms(timeSec);
-      rt.encode(encoder);
+    for (const layer of this.activeLayers) {
+      layer.runtime.writeUniforms(timeSec);
+      layer.runtime.encode(encoder);
+      if (layer.blendBindGroup)
+        this.maskBlender.encode(encoder, layer.blendBindGroup, layer.blendView);
     }
 
     if (this.ctx) {

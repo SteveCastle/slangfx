@@ -179,8 +179,10 @@ async function boot() {
   }
 
   setStatus('ready — load a video or image');
-  window.fx = fx; // console/debug access
+  window.fx = fx;                            // console/debug access
+  window.renderLayerPanel = renderLayerPanel;
   requestAnimationFrame(tick);
+  restoreSession();
 }
 
 /* ---- render loop --------------------------------------------------- */
@@ -201,10 +203,12 @@ function tick() {
 
 /* ---- media --------------------------------------------------------- */
 
-async function loadMedia(file) {
+async function loadMedia(file, { persist = true } = {}) {
   const url = URL.createObjectURL(file);
   const isVideo = file.type.startsWith('video/') || VIDEO_EXTS.test(file.name);
   document.body.classList.add('has-media');
+  stopMaskEdit();
+  if (persist) idbSet('current', file).catch(() => {});
 
   if (isVideo) {
     mediaKind = 'video';
@@ -217,6 +221,7 @@ async function loadMedia(file) {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     await fx.setSourceSize(video.videoWidth, video.videoHeight);
+    rescaleMasks();
     const seekable = Number.isFinite(video.duration) && video.duration > 0;
     scrub.disabled = !seekable;
     scrub.max = seekable ? String(video.duration) : '0';
@@ -232,6 +237,7 @@ async function loadMedia(file) {
     canvas.width = imageBitmap.width;
     canvas.height = imageBitmap.height;
     await fx.setSourceSize(imageBitmap.width, imageBitmap.height);
+    rescaleMasks();
     imageDirty = true;
     scrub.disabled = true;
     playBtn.disabled = true;
@@ -270,6 +276,263 @@ scrub.addEventListener('change', () => {
   video.currentTime = parseFloat(scrub.value);
   scrubbing = false;
 });
+
+/* ---- fullscreen ----------------------------------------------------- */
+
+const canvasStack = $('canvas-stack');
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else canvasStack.requestFullscreen().catch(() => {});
+}
+
+$('btn-fullscreen').addEventListener('click', toggleFullscreen);
+canvasStack.addEventListener('dblclick', () => { if (!maskEdit) toggleFullscreen(); });
+
+/* ---- session persistence -------------------------------------------- */
+
+/* The media file lives in IndexedDB (blobs can't go in localStorage); the
+ * layer stack — paths, params, custom-shader sources, masks as data URLs —
+ * lives in localStorage and is restored on boot. */
+
+const SESSION_KEY = 'slangfx-web.session';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open('slangfx-web', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('media');
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('media', 'readwrite');
+    tx.objectStore('media').put(val, key);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const rq = db.transaction('media', 'readonly').objectStore('media').get(key);
+    rq.onsuccess = () => resolve(rq.result);
+    rq.onerror = () => reject(rq.error);
+  });
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveSession, 600);
+}
+
+function saveSession() {
+  if (!fx) return;
+  const layers = fx.layers.map((layer) => {
+    const isCustom = layer.path.startsWith(CUSTOM_PREFIX);
+    const dir = isCustom ? layer.path.slice(0, -'custom.slangp'.length) : null;
+    const params = {};
+    const src = layer.runtime?.paramValues ?? layer.savedParams;
+    if (src) for (const [k, v] of src) params[k] = v;
+    return {
+      kind: isCustom ? 'custom' : 'preset',
+      path: isCustom ? null : layer.path,
+      source: isCustom ? virtualFiles.get(dir + 'custom.slang') : null,
+      label: layer.label ?? null,
+      savedName: isCustom ? savedNames.get(dir) ?? null : null,
+      enabled: layer.enabled,
+      params,
+      mask: layer.maskState ? {
+        dataURL: layer.maskState.source.toDataURL('image/png'),
+        opacity: layer.maskState.opacity ?? 1,
+        invert: !!layer.maskState.invert,
+      } : null,
+    };
+  });
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ layers })); } catch {}
+}
+
+async function restoreSession() {
+  try {
+    const file = await idbGet('current');
+    if (file) await loadMedia(file, { persist: false });
+  } catch {}
+  if (!fx.inputTexture) return;
+
+  let sess = null;
+  try { sess = JSON.parse(localStorage.getItem(SESSION_KEY)); } catch {}
+  if (!sess?.layers?.length) return;
+
+  setStatus('restoring session…');
+  for (const l of sess.layers) {
+    let idx;
+    if (l.kind === 'custom') {
+      const dir = newCustomLayerFiles(l.source ?? CUSTOM_BOILERPLATE);
+      if (l.savedName) savedNames.set(dir, l.savedName);
+      idx = await fx.addLayer(dir + 'custom.slangp',
+        { label: l.label ?? `custom shader ${dir.split('/')[1]}` });
+    } else {
+      idx = await fx.addLayer(l.path, l.label ? { label: l.label } : {});
+    }
+    for (const [k, v] of Object.entries(l.params ?? {})) fx.setParam(idx, k, v);
+    if (l.mask?.dataURL) {
+      const img = new Image();
+      await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; img.src = l.mask.dataURL; });
+      const c = document.createElement('canvas');
+      c.width = fx.inputW;
+      c.height = fx.inputH;
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      await fx.setLayerMask(idx, c, { opacity: l.mask.opacity, invert: l.mask.invert });
+    }
+    if (l.enabled === false) await fx.toggleLayer(idx, false);
+  }
+  renderLayerPanel();
+  setStatus('session restored');
+}
+
+/* ---- mask painting ------------------------------------------------- */
+
+/* Each masked layer owns a white/black mask canvas (the engine samples its
+ * red channel: white = effect visible). While editing, the visible overlay
+ * canvas shows a red "rubylith" wherever the effect is hidden; strokes are
+ * stamped into both in parallel and streamed to the GPU. */
+
+const maskOverlay = $('mask-overlay');
+const brush = { size: 60, soft: 0.5, mode: 'hide' }; // media-space px
+let maskEdit = null;   // { layerIdx } | null
+
+function makeMaskCanvas() {
+  const c = document.createElement('canvas');
+  c.width = fx.inputW;
+  c.height = fx.inputH;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  return c;
+}
+
+/* Rebuild the rubylith overlay from a mask canvas (edit-start / clear). */
+function rebuildRuby(maskCanvas) {
+  maskOverlay.width = maskCanvas.width;
+  maskOverlay.height = maskCanvas.height;
+  const rctx = maskOverlay.getContext('2d');
+  const mctx = maskCanvas.getContext('2d');
+  const img = mctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+  const out = rctx.createImageData(img.width, img.height);
+  for (let i = 0; i < img.data.length; i += 4) {
+    out.data[i] = 255;                       // red
+    out.data[i + 3] = 255 - img.data[i];     // alpha = hidden amount
+  }
+  rctx.putImageData(out, 0, 0);
+}
+
+function stampBrush(ctx, x, y, erase) {
+  const r = Math.max(brush.size / 2, 1);
+  const g = ctx.createRadialGradient(x, y, r * (1 - brush.soft), x, y, r);
+  ctx.save();
+  if (erase) {
+    ctx.globalCompositeOperation = 'destination-out';
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+  } else {
+    g.addColorStop(0, ctx._stampColor + '1)');
+    g.addColorStop(1, ctx._stampColor + '0)');
+  }
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function maskStroke(x, y) {
+  const layer = fx.layers[maskEdit.layerIdx];
+  if (!layer?.maskState) return;
+  const mctx = layer.maskState.source.getContext('2d');
+  const rctx = maskOverlay.getContext('2d');
+  if (brush.mode === 'hide') {
+    mctx._stampColor = 'rgba(0,0,0,';       // hide effect → mask black
+    stampBrush(mctx, x, y, false);
+    rctx._stampColor = 'rgba(255,0,0,';     // rubylith red
+    stampBrush(rctx, x, y, false);
+  } else {
+    mctx._stampColor = 'rgba(255,255,255,'; // reveal effect → mask white
+    stampBrush(mctx, x, y, false);
+    stampBrush(rctx, x, y, true);           // erase rubylith
+  }
+  fx.updateLayerMask(maskEdit.layerIdx);
+}
+
+function overlayToMedia(e) {
+  const rect = maskOverlay.getBoundingClientRect();
+  return [
+    (e.clientX - rect.left) / rect.width * fx.inputW,
+    (e.clientY - rect.top) / rect.height * fx.inputH,
+  ];
+}
+
+let painting = false;
+let lastPt = null;
+
+maskOverlay.addEventListener('pointerdown', (e) => {
+  if (!maskEdit) return;
+  painting = true;
+  maskOverlay.setPointerCapture(e.pointerId);
+  lastPt = overlayToMedia(e);
+  maskStroke(...lastPt);
+});
+maskOverlay.addEventListener('pointermove', (e) => {
+  if (!painting || !maskEdit) return;
+  const pt = overlayToMedia(e);
+  // Stamp along the segment so fast strokes stay solid.
+  const step = Math.max(brush.size / 4, 2);
+  const d = Math.hypot(pt[0] - lastPt[0], pt[1] - lastPt[1]);
+  const n = Math.max(1, Math.ceil(d / step));
+  for (let i = 1; i <= n; i++)
+    maskStroke(lastPt[0] + (pt[0] - lastPt[0]) * i / n, lastPt[1] + (pt[1] - lastPt[1]) * i / n);
+  lastPt = pt;
+});
+maskOverlay.addEventListener('pointerup', () => { painting = false; lastPt = null; scheduleSave(); });
+
+async function startMaskEdit(layerIdx) {
+  const layer = fx.layers[layerIdx];
+  if (!layer) return;
+  if (!layer.maskState) {
+    await fx.setLayerMask(layerIdx, makeMaskCanvas());
+    renderLayerPanel();
+  }
+  maskEdit = { layerIdx };
+  rebuildRuby(layer.maskState.source);
+  document.body.classList.add('mask-editing');
+  setStatus('painting mask — red = effect hidden');
+  renderLayerPanel();
+}
+
+function stopMaskEdit() {
+  maskEdit = null;
+  painting = false;
+  document.body.classList.remove('mask-editing');
+  renderLayerPanel();
+}
+
+/* Rescale mask canvases when the media (and so the chain dims) changes. */
+function rescaleMasks() {
+  fx.layers.forEach((layer, i) => {
+    const src = layer.maskState?.source;
+    if (!src || (src.width === fx.inputW && src.height === fx.inputH)) return;
+    const scaled = document.createElement('canvas');
+    scaled.width = fx.inputW;
+    scaled.height = fx.inputH;
+    scaled.getContext('2d').drawImage(src, 0, 0, scaled.width, scaled.height);
+    layer.maskState.source = scaled;
+    fx.updateLayerMask(i);
+  });
+}
 
 /* ---- layer stack --------------------------------------------------- */
 
@@ -430,6 +693,7 @@ async function compileCustomLayer(layerIndex, slangPath, source) {
 
 function renderLayerPanel() {
   if (!fx) return;
+  scheduleSave();
   const infos = fx.getLayerInfo();
   layersEl.replaceChildren();
   infos.forEach((info) => {
@@ -443,28 +707,109 @@ function renderLayerPanel() {
     toggle.type = 'checkbox';
     toggle.checked = info.enabled;
     toggle.title = 'bypass';
-    toggle.onchange = async () => { await fx.toggleLayer(info.index, toggle.checked); renderLayerPanel(); };
+    toggle.onchange = async () => { stopMaskEdit(); await fx.toggleLayer(info.index, toggle.checked); renderLayerPanel(); };
 
     const up = document.createElement('button');
     up.textContent = '▲';
     up.disabled = info.index === 0;
-    up.onclick = async () => { await fx.moveLayer(info.index, -1); renderLayerPanel(); };
+    up.onclick = async () => { stopMaskEdit(); await fx.moveLayer(info.index, -1); renderLayerPanel(); };
 
     const down = document.createElement('button');
     down.textContent = '▼';
     down.disabled = info.index === infos.length - 1;
-    down.onclick = async () => { await fx.moveLayer(info.index, +1); renderLayerPanel(); };
+    down.onclick = async () => { stopMaskEdit(); await fx.moveLayer(info.index, +1); renderLayerPanel(); };
 
     const del = document.createElement('button');
     del.textContent = '✕';
-    del.onclick = async () => { await fx.removeLayer(info.index); renderLayerPanel(); };
+    del.onclick = async () => { stopMaskEdit(); await fx.removeLayer(info.index); renderLayerPanel(); };
+
+    const maskBtn = document.createElement('button');
+    maskBtn.textContent = '▦';
+    maskBtn.title = info.mask ? 'edit mask' : 'add a mask (paint where the effect should NOT apply)';
+    maskBtn.style.color = maskEdit?.layerIdx === info.index ? 'var(--accent)'
+      : info.mask ? 'var(--fg)' : '';
+    maskBtn.onclick = () => {
+      if (maskEdit?.layerIdx === info.index) stopMaskEdit();
+      else startMaskEdit(info.index);
+    };
 
     const name = document.createElement('span');
     name.className = 'name' + (info.enabled ? '' : ' off');
-    name.textContent = `${info.index}. ${info.name}`;
+    name.textContent = `${info.index}. ${info.name}` + (info.mask ? ' ▦' : '');
 
-    head.append(toggle, up, down, del, name);
+    head.append(toggle, up, down, del, maskBtn, name);
     div.appendChild(head);
+
+    if (maskEdit?.layerIdx === info.index && info.mask) {
+      const mc = document.createElement('div');
+      mc.className = 'mask-controls';
+
+      const modeHide = document.createElement('button');
+      modeHide.className = 'btn' + (brush.mode === 'hide' ? ' active' : '');
+      modeHide.textContent = 'Hide fx';
+      modeHide.onclick = () => { brush.mode = 'hide'; renderLayerPanel(); };
+      const modeShow = document.createElement('button');
+      modeShow.className = 'btn' + (brush.mode === 'show' ? ' active' : '');
+      modeShow.textContent = 'Show fx';
+      modeShow.onclick = () => { brush.mode = 'show'; renderLayerPanel(); };
+
+      const sizeLabel = document.createElement('label');
+      sizeLabel.textContent = 'size';
+      const size = document.createElement('input');
+      size.type = 'range';
+      size.min = '8'; size.max = '300'; size.value = String(brush.size);
+      size.oninput = () => { brush.size = parseFloat(size.value); };
+      sizeLabel.appendChild(size);
+
+      const softLabel = document.createElement('label');
+      softLabel.textContent = 'soft';
+      const soft = document.createElement('input');
+      soft.type = 'range';
+      soft.min = '0'; soft.max = '0.9'; soft.step = '0.05'; soft.value = String(brush.soft);
+      soft.oninput = () => { brush.soft = parseFloat(soft.value); };
+      softLabel.appendChild(soft);
+
+      const invLabel = document.createElement('label');
+      const inv = document.createElement('input');
+      inv.type = 'checkbox';
+      inv.checked = info.mask.invert;
+      inv.onchange = () => { fx.setLayerMaskOptions(info.index, { invert: inv.checked }); scheduleSave(); };
+      invLabel.append(inv, 'invert');
+
+      const opLabel = document.createElement('label');
+      opLabel.textContent = 'opacity';
+      const op = document.createElement('input');
+      op.type = 'range';
+      op.min = '0'; op.max = '1'; op.step = '0.01'; op.value = String(info.mask.opacity);
+      op.oninput = () => { fx.setLayerMaskOptions(info.index, { opacity: parseFloat(op.value) }); scheduleSave(); };
+      opLabel.appendChild(op);
+
+      const clear = document.createElement('button');
+      clear.className = 'btn';
+      clear.textContent = 'Clear';
+      clear.onclick = () => {
+        const src = fx.layers[info.index].maskState.source;
+        const ctx2 = src.getContext('2d');
+        ctx2.globalCompositeOperation = 'source-over';
+        ctx2.fillStyle = '#fff';
+        ctx2.fillRect(0, 0, src.width, src.height);
+        maskOverlay.getContext('2d').clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+        fx.updateLayerMask(info.index);
+      };
+
+      const remove = document.createElement('button');
+      remove.className = 'btn';
+      remove.textContent = 'Remove';
+      remove.onclick = async () => { stopMaskEdit(); await fx.clearLayerMask(info.index); renderLayerPanel(); };
+
+      const done = document.createElement('button');
+      done.className = 'btn';
+      done.textContent = 'Done';
+      done.onclick = () => stopMaskEdit();
+
+      mc.append(modeHide, modeShow, sizeLabel, softLabel, invLabel, opLabel, clear, remove, done);
+      div.appendChild(mc);
+    }
 
     if (info.error) {
       const err = document.createElement('div');
@@ -579,6 +924,7 @@ function renderLayerPanel() {
           const v = parseFloat(slider.value);
           fx.setParam(info.index, p.name, v);
           val.textContent = v.toFixed(3).replace(/\.?0+$/, '') || '0';
+          scheduleSave();
         };
 
         row.append(label, slider, val);

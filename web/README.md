@@ -6,7 +6,7 @@ counterpart of the native Vulkan `slangfx` binary, packaged as a reusable ES
 module (`slangfx-web`) plus a proof-of-concept UI that mirrors
 `wrappers/slangfx_live.py`.
 
-All 48 bundled presets under [`shaders/`](../shaders) compile and render in
+All 58 bundled presets under [`shaders/`](../shaders) compile and render in
 Chrome — including multi-pass chains, half-res blur passes, `PassFeedback`
 motion effects, and float framebuffers.
 
@@ -30,7 +30,13 @@ grouped into collapsible category folders (mirroring the
 `shaders/<category>/` layout), and typing in the search box collapses
 everything into a flat filtered list (matches on effect or category name;
 Enter adds the first hit). Sliders update live with no rebuild; PNG frame
-export and WebM recording are built in.
+export and WebM recording are built in. The **⛶** button (or double-click)
+takes the preview fullscreen — works for video and still images alike.
+
+Sessions persist across reloads: the loaded media file is kept in
+IndexedDB and the layer stack — order, enabled state, slider values,
+custom-shader sources, and painted masks — in localStorage, restored
+automatically on the next visit.
 
 ### Write your own shader in the browser
 
@@ -56,6 +62,23 @@ a push-constant member and works in regular `.slang` files too; classic
 **Save** stores the shader under a name in the browser's localStorage;
 saved shaders reappear in the **Add layer…** menu (🗎) across sessions, and
 **Forget** deletes one.
+
+### Mask a layer's effect
+
+The **▦** button on any layer opens mask painting: brush over the preview
+to hide the effect where you paint (red overlay = hidden; the mask starts
+fully white = effect everywhere). The engine composites
+`mix(layerInput, layerOutput, mask)` in a built-in pass, so masking works
+with every shader — bundled or custom — with no shader changes. Controls:
+Hide fx / Show fx brush modes, size, softness, invert, mask opacity,
+Clear, Remove.
+
+Engine API: `setLayerMask(i, canvas, {opacity, invert})`,
+`updateLayerMask(i)` (cheap re-upload during strokes),
+`setLayerMaskOptions(i, {...})`, `clearLayerMask(i)`. Custom shaders can
+also read the painted mask directly by declaring
+`layout(set = 0, binding = 4) uniform sampler2D Mask;` (white when no
+mask is set).
 
 Run the offline compile test (no browser needed — the same wasm toolchain
 runs under Node):
@@ -138,7 +161,7 @@ const fx = await SlangFx.create({
 });
 
 await fx.setSourceSize(video.videoWidth, video.videoHeight);
-await fx.addLayer('shaders/blur-bloom/soft-crt/soft-crt.slangp');
+await fx.addLayer('shaders/crt/soft-crt/soft-crt.slangp');
 await fx.addLayer('shaders/motion/motion-trails/motion-trails.slangp');
 fx.setParam(0, 'scan_strength', 0.3);              // live, no rebuild
 

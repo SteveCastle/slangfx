@@ -137,14 +137,80 @@ main { flex: 1; display: flex; min-height: 0; }
 #drop-hint small { font-size: 12px; margin-top: 6px; }
 body.has-media #drop-hint { display: none; }
 
-#preview {
+#canvas-stack {
+  position: relative;
+  display: none;
+  width: fit-content;
   max-width: 100%;
   max-height: calc(100% - 40px);
+  min-height: 0;
+}
+body.has-media #canvas-stack { display: block; }
+
+#canvas-stack:fullscreen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  background: #000;
+}
+
+#canvas-inner {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+#preview {
+  max-width: 100%;
+  max-height: 100%;
   background: #000;
   border: 1px solid var(--border);
+  display: block;
+}
+#canvas-stack:fullscreen #canvas-inner {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+}
+#canvas-stack:fullscreen #preview {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  border: none;
+}
+
+#btn-fullscreen {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+#canvas-stack:hover #btn-fullscreen { opacity: 0.85; }
+
+#mask-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.45;
+  pointer-events: none;
   display: none;
 }
-body.has-media #preview { display: block; }
+body.mask-editing #mask-overlay {
+  display: block;
+  pointer-events: auto;
+  cursor: crosshair;
+}
 
 #transport {
   display: none;
@@ -210,6 +276,20 @@ body.has-media #transport { display: flex; }
 .param-row label { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .param-row input[type=range] { width: 100%; accent-color: var(--accent); }
 .param-row .val { text-align: right; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--fg); }
+
+.mask-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--dim);
+}
+.mask-controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.mask-controls input[type=range] { width: 64px; accent-color: var(--accent); }
+.mask-controls .btn.active { border-color: var(--accent); color: var(--accent); }
 
 .layer-editor { padding: 6px 8px 8px; border-top: 1px solid var(--border); }
 .layer-editor textarea {
