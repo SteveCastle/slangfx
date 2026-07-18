@@ -124,6 +124,7 @@ let imageBitmap = null;
 let imageDirty = false;
 let scrubbing = false;
 let recorder = null;
+let elementCapture = null;   // lazy HTMLMediaElement.captureStream for audio
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -1108,7 +1109,24 @@ $('btn-export-webm').addEventListener('click', () => {
   }
   if (!fx || !fx.inputTexture) return;
   const stream = canvas.captureStream(30);
-  recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 12_000_000 });
+
+  // Mix the source video's audio into the recording (spec: element capture
+  // audio is pre-volume/mute, so recordings get sound even while previewing
+  // muted — matching the native exporter, which copies the audio track).
+  if (mediaKind === 'video' && video.readyState >= 2) {
+    try {
+      elementCapture ??= video.captureStream();
+      for (const t of elementCapture.getAudioTracks()) stream.addTrack(t);
+    } catch (e) {
+      console.warn('slangfx: could not capture video audio for recording:', e);
+    }
+  }
+
+  const withAudio = stream.getAudioTracks().length > 0;
+  const mime = withAudio && MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+    ? 'video/webm;codecs=vp9,opus'
+    : 'video/webm;codecs=vp9';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
   const chunks = [];
   recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
   recorder.onstop = () => {
