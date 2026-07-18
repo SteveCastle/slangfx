@@ -225,7 +225,10 @@ async function loadMedia(file, { persist = true } = {}) {
     scrub.max = seekable ? String(video.duration) : '0';
     playBtn.disabled = false;
     playBtn.textContent = 'Pause';
-    await video.play().catch(() => {});
+    muteBtn.disabled = false;
+    volumeSlider.disabled = false;
+    applyAudioPrefs();
+    await playWithAudioPolicy();
     setStatus(`${file.name} — ${video.videoWidth}×${video.videoHeight}`);
   } else {
     mediaKind = 'image';
@@ -239,6 +242,8 @@ async function loadMedia(file, { persist = true } = {}) {
     imageDirty = true;
     scrub.disabled = true;
     playBtn.disabled = true;
+    muteBtn.disabled = true;
+    volumeSlider.disabled = true;
     timeLabel.textContent = '--:-- / --:--';
     setStatus(`${file.name} — ${imageBitmap.width}×${imageBitmap.height}`);
   }
@@ -264,6 +269,60 @@ document.body.addEventListener('drop', async (e) => {
 playBtn.addEventListener('click', () => {
   if (video.paused) { video.play(); playBtn.textContent = 'Pause'; }
   else { video.pause(); playBtn.textContent = 'Play'; }
+});
+
+/* ---- audio --------------------------------------------------------- */
+
+const AUDIO_KEY = 'slangfx-web.audio';
+const muteBtn = $('btn-mute');
+const volumeSlider = $('volume');
+
+function audioPrefs() {
+  try { return JSON.parse(localStorage.getItem(AUDIO_KEY)) ?? {}; }
+  catch { return {}; }
+}
+
+function saveAudioPrefs() {
+  try { localStorage.setItem(AUDIO_KEY, JSON.stringify({ muted: video.muted, volume: video.volume })); } catch {}
+}
+
+function updateAudioUI() {
+  muteBtn.textContent = video.muted || video.volume === 0 ? '🔇' : '🔊';
+  volumeSlider.value = String(video.volume);
+}
+
+/* Apply stored prefs; if the browser blocks unmuted autoplay, fall back
+ * to muted so playback still starts, and let the user unmute by hand. */
+function applyAudioPrefs() {
+  const p = audioPrefs();
+  video.volume = p.volume ?? 1;
+  video.muted = p.muted ?? false;
+  updateAudioUI();
+}
+
+async function playWithAudioPolicy() {
+  try {
+    await video.play();
+  } catch {
+    video.muted = true;
+    updateAudioUI();
+    setStatus('autoplay was blocked with sound — click 🔇 to unmute');
+    await video.play().catch(() => {});
+  }
+}
+
+muteBtn.addEventListener('click', () => {
+  video.muted = !video.muted;
+  if (!video.muted && video.volume === 0) video.volume = 0.5;
+  updateAudioUI();
+  saveAudioPrefs();
+});
+
+volumeSlider.addEventListener('input', () => {
+  video.volume = parseFloat(volumeSlider.value);
+  if (video.volume > 0) video.muted = false;   // moving the slider implies sound
+  updateAudioUI();
+  saveAudioPrefs();
 });
 
 scrub.addEventListener('input', () => {

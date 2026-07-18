@@ -327,6 +327,8 @@ body.has-media #transport { display: flex; }
 
 #scrub { flex: 1; accent-color: var(--accent); }
 #time-label { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+#btn-mute { min-width: 34px; }
+#volume { width: 84px; accent-color: var(--accent); }
 
 #panel:has(.layer-editor) { width: 480px; }
 
