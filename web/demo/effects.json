@@ -13,6 +13,10 @@
       "label": "Stylize"
     },
     {
+      "id": "split",
+      "label": "Colour split"
+    },
+    {
       "id": "dither",
       "label": "Dithering"
     },
@@ -288,6 +292,41 @@
       "name": "voronoi-shatter",
       "path": "shaders/motion/voronoi-shatter/voronoi-shatter.slangp",
       "category": "motion"
+    },
+    {
+      "name": "anaglyph-3d",
+      "path": "shaders/split/anaglyph-3d/anaglyph-3d.slangp",
+      "category": "split"
+    },
+    {
+      "name": "channel-drift",
+      "path": "shaders/split/channel-drift/channel-drift.slangp",
+      "category": "split"
+    },
+    {
+      "name": "chromatic-aberration",
+      "path": "shaders/split/chromatic-aberration/chromatic-aberration.slangp",
+      "category": "split"
+    },
+    {
+      "name": "radial-split",
+      "path": "shaders/split/radial-split/radial-split.slangp",
+      "category": "split"
+    },
+    {
+      "name": "rgb-split",
+      "path": "shaders/split/rgb-split/rgb-split.slangp",
+      "category": "split"
+    },
+    {
+      "name": "spectrum-smear",
+      "path": "shaders/split/spectrum-smear/spectrum-smear.slangp",
+      "category": "split"
+    },
+    {
+      "name": "time-split",
+      "path": "shaders/split/time-split/time-split.slangp",
+      "category": "split"
     },
     {
       "name": "duotone",

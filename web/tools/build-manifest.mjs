@@ -13,6 +13,7 @@ const CATEGORY_LABELS = {
   adjust: 'Adjust',
   'blur-bloom': 'Blur & bloom',
   stylize: 'Stylize',
+  split: 'Colour split',
   dither: 'Dithering',
   crt: 'CRT & retro displays',
   motion: 'Motion-reactive',

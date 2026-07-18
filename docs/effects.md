@@ -69,6 +69,21 @@ Graphic looks — print, cel, false-colour, geometric.
 | `pixelate` | 1 | Mosaic resample to N-px blocks. | `px` |
 | `sobel-neon` | 1 | Sobel edge detection drawn as glowing neon lines whose hue follows the gradient direction; the flat interior is darkened so edges pop. | `scale` (edge gain), `threshold`, `glow`, `bg` |
 
+## Colour split
+
+Channel-separation looks — every way to pull R, G and B apart. (See also
+`chroma-shift` under Glitch & analog for the original single-tap radial CA.)
+
+| Effect | Passes | What it does | Key params |
+|---|---|---|---|
+| `rgb-split` | 1 | The classic directional split: red and blue pull apart along an angle, with R/B balance and an animated wiggle. | `dist_rs`, `angle_rs`, `spread_rs`, `wiggle_rs` |
+| `chromatic-aberration` | 1 | Lens-style transverse CA: channels resampled at different radial magnifications across soft multi-tap fringes, growing toward the edges. | `strength_ca`, `falloff_ca`, `soft_ca` |
+| `anaglyph-3d` | 1 | 3D-glasses encoding (red/cyan, green/magenta, amber/blue) from a faked stereo pair; luma-driven pseudo-depth makes bright things pop. Works with real paper glasses. | `sep_3d`, `depth_3d`, `mode_3d`, `rivalry_3d` |
+| `spectrum-smear` | 1 | Prismatic rainbow streak: the frame smears along a direction (or radially) with spectrally-tinted taps — highlights drag little rainbows. | `length_sp`, `angle_sp`, `radial_sp`, `vivid_sp` |
+| `channel-drift` | 1 | R/G/B wander independent Lissajous orbits — woozy projector-plate misregistration, from dreamy to nervous. | `drift_cd`, `speed_cd`, `sway_cd` |
+| `radial-split` | 1 | Red and blue counter-rotate around the centre, growing with radius: registered core, RGB pinwheel edges. | `rot_rp`, `falloff_rp` |
+| `time-split` | 1 | Temporal split: green and blue lag behind the live red channel through feedback — motion pulls rainbow fringes, stills stay registered. | `lag_g`, `lag_b` |
+
 ## Dithering
 
 Ten ways to lie about how many tones you have. Different threshold
@@ -137,8 +152,9 @@ inter-frame change — no audio needed.
 ## Tempo-synced
 
 These take your track's tempo (`bpm`) and the render `fps` and gate the effect
-to the beat (`beat_div` = subdivision). Set `bpm`/`fps` to match your song; pair
-with `beat_cut.py` for cut-locked visuals.
+to the beat (`beat_div` = subdivision). Set `bpm`/`fps` to match your song, then
+slide `beat_phase` (±1 beat) to line the hits up with the track's actual
+downbeats. Pair with `beat_cut.py` for cut-locked visuals.
 
 | Effect | Passes | What it does | Key params |
 |---|---|---|---|
@@ -162,8 +178,8 @@ with `beat_cut.py` for cut-locked visuals.
 - Each effect is self-contained in its folder (`<name>.slang` + `<name>.slangp`,
   plus any helper passes). Copy a folder as a starting template. Effects are
   grouped into category folders — `shaders/<category>/<effect>/` — matching
-  the sections on this page (`adjust`, `blur-bloom`, `stylize`, `dither`,
-  `crt`, `motion`, `beat`, `glitch`).
+  the sections on this page (`adjust`, `blur-bloom`, `stylize`, `split`,
+  `dither`, `crt`, `motion`, `beat`, `glitch`).
 - The standard push-constant fields (`SourceSize`, `OriginalSize`, `OutputSize`,
   `FrameCount`) and the realtime `Time` field are available; see
   [slang format]({{ '/slang_format.html' | relative_url }}).

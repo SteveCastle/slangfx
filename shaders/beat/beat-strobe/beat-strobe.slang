@@ -20,6 +20,7 @@ layout(push_constant) uniform Push
     float bpm;
     float fps;
     float beat_div;
+    float beat_phase;
     float strobe;
     float zoom_punch;
     float punch_decay;
@@ -31,6 +32,7 @@ layout(push_constant) uniform Push
 #pragma parameter bpm          "Strobe: BPM"               120.0 40.0 220.0 0.5
 #pragma parameter fps          "Strobe: footage fps"       24.0  1.0  120.0 1.0
 #pragma parameter beat_div     "Strobe: beat subdivision"  1.0   0.25 8.0   0.25
+#pragma parameter beat_phase   "Strobe: beat phase (beats)" 0.0 -1.0 1.0 0.01
 #pragma parameter strobe       "Strobe: flash strength"    0.6   0.0  3.0   0.05
 #pragma parameter zoom_punch   "Strobe: zoom punch"        0.12  0.0  0.6   0.01
 #pragma parameter punch_decay  "Strobe: pulse tightness"   6.0   1.0  20.0  0.5
@@ -56,7 +58,7 @@ void main()
 
     /* Beat clock + sharp-attack / exp-decay envelope (1 at the beat, →0). */
     float t     = float(params.FrameCount) / max(params.fps, 1.0);
-    float beats = t * params.bpm / 60.0 * params.beat_div;
+    float beats = t * params.bpm / 60.0 * params.beat_div - params.beat_phase;
     float phase = fract(beats);
     float idx   = floor(beats);
     float env   = exp(-phase * params.punch_decay);

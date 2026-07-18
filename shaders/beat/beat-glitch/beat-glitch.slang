@@ -21,6 +21,7 @@ layout(push_constant) uniform Push
     float bpm;
     float fps;
     float beat_div;
+    float beat_phase;
     float attack_decay;
     float accent_every;
     float slice_amount;
@@ -34,6 +35,7 @@ layout(push_constant) uniform Push
 #pragma parameter bpm            "BeatGlitch: BPM"             120.0 40.0 220.0 0.5
 #pragma parameter fps            "BeatGlitch: footage fps"     24.0  1.0  120.0 1.0
 #pragma parameter beat_div       "BeatGlitch: beat subdivision" 1.0  0.25 8.0   0.25
+#pragma parameter beat_phase   "BeatGlitch: beat phase (beats)" 0.0 -1.0 1.0 0.01
 #pragma parameter attack_decay   "BeatGlitch: hit tightness"   7.0   1.0  24.0  0.5
 #pragma parameter accent_every   "BeatGlitch: accent each N"   4.0   1.0  16.0  1.0
 #pragma parameter slice_amount   "BeatGlitch: slice shift"     0.15  0.0  0.5   0.005
@@ -64,7 +66,7 @@ void main()
 
     /* Beat clock + hit envelope, accented on the downbeat. */
     float t      = float(params.FrameCount) / max(params.fps, 1.0);
-    float beats  = t * params.bpm / 60.0 * params.beat_div;
+    float beats  = t * params.bpm / 60.0 * params.beat_div - params.beat_phase;
     float phase  = fract(beats);
     float idx    = floor(beats);
     float accent = mix(1.0, 1.7, step(mod(idx, max(params.accent_every, 1.0)), 0.5));

@@ -6,7 +6,7 @@ counterpart of the native Vulkan `slangfx` binary, packaged as a reusable ES
 module (`slangfx-web`) plus a proof-of-concept UI that mirrors
 `wrappers/slangfx_live.py`.
 
-All 58 bundled presets under [`shaders/`](../shaders) compile and render in
+All 65 bundled presets under [`shaders/`](../shaders) compile and render in
 Chrome — including multi-pass chains, half-res blur passes, `PassFeedback`
 motion effects, and float framebuffers.
 

@@ -20,6 +20,7 @@ layout(push_constant) uniform Push
     float bpm;
     float fps;
     float beat_div;
+    float beat_phase;
     float segments;
     float spin;
     float beat_kick;
@@ -31,6 +32,7 @@ layout(push_constant) uniform Push
 #pragma parameter bpm         "Kaleido: BPM"              120.0 40.0 220.0 0.5
 #pragma parameter fps         "Kaleido: footage fps"      24.0  1.0  120.0 1.0
 #pragma parameter beat_div    "Kaleido: beat subdivision" 1.0   0.25 8.0   0.25
+#pragma parameter beat_phase   "BeatKaleido: beat phase (beats)" 0.0 -1.0 1.0 0.01
 #pragma parameter segments    "Kaleido: mirror segments"  6.0   2.0  24.0  1.0
 #pragma parameter spin        "Kaleido: drift spin"       0.2   -2.0 2.0   0.05
 #pragma parameter beat_kick   "Kaleido: rotation snap"    0.5   0.0  3.14  0.05
@@ -56,7 +58,7 @@ void main()
 
     /* Beat clock + envelope. */
     float t     = float(params.FrameCount) / max(params.fps, 1.0);
-    float beats = t * params.bpm / 60.0 * params.beat_div;
+    float beats = t * params.bpm / 60.0 * params.beat_div - params.beat_phase;
     float phase = fract(beats);
     float idx   = floor(beats);
     float env   = exp(-phase * params.pulse_decay);
