@@ -5,6 +5,8 @@ used by RetroArch's vulkan / glcore drivers, including the entire
 [libretro/slang-shaders](https://github.com/libretro/slang-shaders) corpus
 (CRT, scanlines, NTSC/VHS, scalers, AA, …) — to any video file.
 
+Used by [https://lowkeyviewer.com](Lowkey Media Viewer)
+
 Runs as a standalone Vulkan-based binary that takes raw RGBA frames on
 stdin and writes processed frames on stdout. ffmpeg handles decode and
 encode through pipes.
